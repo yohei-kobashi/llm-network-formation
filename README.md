@@ -36,7 +36,7 @@ The (cached) outputs of the simulations are located in `outputs/`. If you wish t
 
 ### Simulation outputs for the real-world datasets and human baseline data
 
-The simulation outputs for the real-world datasets can be found [here](https://drive.google.com/drive/folders/1nalOHz7fYA7EFegZ1wKuwz56BMuZB1ex?usp=drive_link). 
+The simulation outputs for the real-world datasets can be found [here](https://doi.org/10.5281/zenodo.17196412). 
 
 To include the pre-run simulation outputs in the project, download them and place them in the `outputs/` folder. 
 To include the human baseline data in the project, download them and place them in the `user_study_data_public` directory.
