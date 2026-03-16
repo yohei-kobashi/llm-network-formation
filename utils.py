@@ -3,7 +3,6 @@ import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
 import json
-import openai
 import random
 import os
 import copy
@@ -14,16 +13,26 @@ import powerlaw as pwl
 import seaborn as sns
 import replicate
 import anthropic
+import torch
+from openai import OpenAI
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-with open('params.json') as f:
-    params = json.load(f)
+def _get_required_env(name):
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
-openai.api_key = params['OPENAI_API_KEY']
-openai.organization = params['OPENAI_ORG']
+claude_api_key = os.getenv('ANTHROPIC_API_KEY')
+replicate_api_token = os.getenv('REPLICATE_API_KEY')
 
-claude_client = anthropic.Anthropic(api_key=params['ANTHROPIC_API_KEY'])
-replicate_client = replicate.Client(api_token=params['REPLICATE_API_KEY'])
-openai_client = openai.Client(api_key=params['OPENAI_API_KEY'])
+claude_client = anthropic.Anthropic(api_key=claude_api_key) if claude_api_key else None
+replicate_client = replicate.Client(api_token=replicate_api_token) if replicate_api_token else None
+openai_client = OpenAI(
+    api_key=_get_required_env('OPENAI_API_KEY'),
+    organization=os.getenv('OPENAI_ORG'),
+)
+hf_clients = {}
 
 def set_plot_sizes():
 
@@ -40,17 +49,67 @@ def set_plot_sizes():
     plt.rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
 
 
+def _get_huggingface_client(model):
+    if model not in hf_clients:
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model,
+            torch_dtype="auto",
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        hf_clients[model] = (tokenizer, hf_model)
+
+    return hf_clients[model]
+
+
+def _get_huggingface_response(prompt, model, temperature, system_prompt):
+    tokenizer, hf_model = _get_huggingface_client(model)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+    input_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    model_inputs = tokenizer(input_text, return_tensors="pt")
+    device = next(hf_model.parameters()).device
+    model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+
+    generation_kwargs = {
+        "max_new_tokens": 1000,
+        "pad_token_id": tokenizer.pad_token_id,
+    }
+    if temperature in (None, 0):
+        generation_kwargs["do_sample"] = False
+    else:
+        generation_kwargs["do_sample"] = True
+        generation_kwargs["temperature"] = temperature
+        generation_kwargs["top_p"] = 0.95
+
+    outputs = hf_model.generate(**model_inputs, **generation_kwargs)
+    generated_tokens = outputs[0][model_inputs["input_ids"].shape[-1]:]
+
+    return tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+
 def get_response(prompt, model, temperature=0.9, system_prompt="You are mimicking a real-life person who wants to make friends."):
     if model.startswith('gpt'):
-        result = openai_client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-        ])
+        request_kwargs = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": prompt,
+        }
+        if temperature is not None and not model.startswith('gpt-5'):
+            request_kwargs["temperature"] = temperature
 
-        return result.choices[0].message.content
+        result = openai_client.responses.create(**request_kwargs)
+        return result.output_text
     elif model.startswith('claude'):
         global claude_client
         result = claude_client.messages.create(
@@ -71,12 +130,15 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
             ])
         
         return result.content[0].text
+    elif model.startswith('Qwen/'):
+        return _get_huggingface_response(prompt, model, temperature, system_prompt)
     else:
         global replicate_client
         replicate_input = {
             'prompt' : prompt,
-            'temperature' : temperature,
         }
+        if temperature is not None:
+            replicate_input['temperature'] = temperature
 
         result = replicate_client.run(model, replicate_input)
 
