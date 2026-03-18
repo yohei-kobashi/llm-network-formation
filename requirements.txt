@@ -9,7 +9,6 @@ powerlaw
 openai
 anthropic
 replicate
-transformers
+transformers[serving] @ git+https://github.com/huggingface/transformers.git@main
 torch
 accelerate
-vllm
