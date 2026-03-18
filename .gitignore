@@ -165,7 +165,7 @@ params*.json
 user_study_data/
 user_study_data_public/
 tables/
-outputs/
+# outputs/
 outputs_simple/
 figures/
 figures-revised/
