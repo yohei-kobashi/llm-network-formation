@@ -12,3 +12,4 @@ replicate
 transformers
 torch
 accelerate
+vllm

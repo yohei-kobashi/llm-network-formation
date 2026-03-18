@@ -15,7 +15,12 @@ import replicate
 import anthropic
 import torch
 from openai import OpenAI
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
+
+try:
+    import vllm
+except ImportError:
+    vllm = None
 
 def _get_required_env(name):
     value = os.getenv(name)
@@ -32,7 +37,7 @@ openai_client = OpenAI(
     api_key=_get_required_env('OPENAI_API_KEY'),
     organization=os.getenv('OPENAI_ORG'),
 )
-hf_clients = {}
+vllm_clients = {}
 
 def set_plot_sizes():
 
@@ -49,25 +54,51 @@ def set_plot_sizes():
     plt.rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
 
 
-def _get_huggingface_client(model):
-    if model not in hf_clients:
+def _get_vllm_client(model):
+    if vllm is None:
+        raise RuntimeError(
+            "Qwen models now require vLLM, but `vllm` is not installed. "
+            "Install dependencies again after adding vllm to requirements.txt."
+        )
+
+    if model not in vllm_clients:
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model,
-            torch_dtype="auto",
-            device_map="auto",
+        llm = vllm.LLM(
+            model=model,
             trust_remote_code=True,
         )
-        hf_clients[model] = (tokenizer, hf_model)
+        vllm_clients[model] = (tokenizer, llm)
 
-    return hf_clients[model]
+    return vllm_clients[model]
 
 
-def _get_huggingface_response(prompt, model, temperature, system_prompt):
-    tokenizer, hf_model = _get_huggingface_client(model)
+def is_huggingface_model_supported(model):
+    if not model.startswith('Qwen/'):
+        return True
+
+    return vllm is not None
+
+
+def filter_supported_models(models):
+    supported_models = []
+
+    for model in models:
+        if is_huggingface_model_supported(model):
+            supported_models.append(model)
+            continue
+
+        print(
+            f"Skipping {model}: vLLM is not installed in the current environment."
+        )
+
+    return supported_models
+
+
+def _get_vllm_response(prompt, model, temperature, system_prompt):
+    tokenizer, llm = _get_vllm_client(model)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
@@ -77,25 +108,13 @@ def _get_huggingface_response(prompt, model, temperature, system_prompt):
         tokenize=False,
         add_generation_prompt=True,
     )
-    model_inputs = tokenizer(input_text, return_tensors="pt")
-    device = next(hf_model.parameters()).device
-    model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
-
-    generation_kwargs = {
-        "max_new_tokens": 1000,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
-    if temperature in (None, 0):
-        generation_kwargs["do_sample"] = False
-    else:
-        generation_kwargs["do_sample"] = True
-        generation_kwargs["temperature"] = temperature
-        generation_kwargs["top_p"] = 0.95
-
-    outputs = hf_model.generate(**model_inputs, **generation_kwargs)
-    generated_tokens = outputs[0][model_inputs["input_ids"].shape[-1]:]
-
-    return tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    sampling_params = vllm.SamplingParams(
+        temperature=0 if temperature in (None, 0) else temperature,
+        top_p=1.0 if temperature in (None, 0) else 0.95,
+        max_tokens=1000,
+    )
+    outputs = llm.generate([input_text], sampling_params=sampling_params)
+    return outputs[0].outputs[0].text
 
 
 def get_response(prompt, model, temperature=0.9, system_prompt="You are mimicking a real-life person who wants to make friends."):
@@ -131,7 +150,7 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
         
         return result.content[0].text
     elif model.startswith('Qwen/'):
-        return _get_huggingface_response(prompt, model, temperature, system_prompt)
+        return _get_vllm_response(prompt, model, temperature, system_prompt)
     else:
         global replicate_client
         replicate_input = {
