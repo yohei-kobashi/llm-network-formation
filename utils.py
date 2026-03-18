@@ -56,7 +56,7 @@ def _get_huggingface_client(model):
             tokenizer.pad_token = tokenizer.eos_token
 
         hf_model = AutoModelForCausalLM.from_pretrained(
-            model=model,
+            model,
             torch_dtype="auto",
             device_map="auto",
             trust_remote_code=True,
