@@ -78,8 +78,8 @@ def infer_vocab_size(tokenizer, model, config):
     if not candidate_values:
         raise RuntimeError("Could not infer vocab_size from config, tokenizer, or model.")
 
-    source, vocab_size = candidate_values[0]
-    return source, vocab_size
+    source, vocab_size = max(candidate_values, key=lambda item: item[1])
+    return source, vocab_size, candidate_values
 
 
 def build_candidates(name_mode: str = "int"):
@@ -198,8 +198,9 @@ def generate_raw_response(
     device = next(model.parameters()).device
     model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
 
-    vocab_size_source, vocab_size = infer_vocab_size(tokenizer, model, config)
+    vocab_size_source, vocab_size, vocab_size_candidates = infer_vocab_size(tokenizer, model, config)
     print(f"[xgrammar] using vocab_size={vocab_size} from {vocab_size_source}")
+    print(f"[xgrammar] vocab size candidates: {vocab_size_candidates}")
 
     tokenizer_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
     grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
