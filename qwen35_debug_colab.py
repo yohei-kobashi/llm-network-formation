@@ -50,6 +50,38 @@ def get_hf_client(model_id: str):
     return _HF_CACHE[model_id]
 
 
+def infer_vocab_size(tokenizer, model, config):
+    candidate_values = []
+
+    for attr in ("vocab_size",):
+        value = getattr(config, attr, None)
+        if isinstance(value, int) and value > 0:
+            candidate_values.append(("config.vocab_size", value))
+
+    value = getattr(tokenizer, "vocab_size", None)
+    if isinstance(value, int) and value > 0:
+        candidate_values.append(("tokenizer.vocab_size", value))
+
+    try:
+        vocab = tokenizer.get_vocab()
+        if isinstance(vocab, dict) and len(vocab) > 0:
+            candidate_values.append(("len(tokenizer.get_vocab())", len(vocab)))
+    except Exception:
+        pass
+
+    embedding_layer = model.get_input_embeddings()
+    if embedding_layer is not None and hasattr(embedding_layer, "num_embeddings"):
+        value = getattr(embedding_layer, "num_embeddings", None)
+        if isinstance(value, int) and value > 0:
+            candidate_values.append(("model.get_input_embeddings().num_embeddings", value))
+
+    if not candidate_values:
+        raise RuntimeError("Could not infer vocab_size from config, tokenizer, or model.")
+
+    source, vocab_size = candidate_values[0]
+    return source, vocab_size
+
+
 def build_candidates(name_mode: str = "int"):
     if name_mode == "int":
         return [
@@ -166,10 +198,10 @@ def generate_raw_response(
     device = next(model.parameters()).device
     model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
 
-    tokenizer_info = xgr.TokenizerInfo.from_huggingface(
-        tokenizer,
-        vocab_size=config.vocab_size,
-    )
+    vocab_size_source, vocab_size = infer_vocab_size(tokenizer, model, config)
+    print(f"[xgrammar] using vocab_size={vocab_size} from {vocab_size_source}")
+
+    tokenizer_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
     grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
     compiled_grammar = grammar_compiler.compile_json_schema(json.dumps(response_schema))
     xgr_logits_processor = xgr.contrib.hf.LogitsProcessor(compiled_grammar)
