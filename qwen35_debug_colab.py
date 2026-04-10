@@ -5,6 +5,13 @@ from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.generation import logits_process as transformers_logits_process
+
+if (
+    not hasattr(transformers_logits_process, "LogitsWarper")
+    and hasattr(transformers_logits_process, "LogitsProcessor")
+):
+    transformers_logits_process.LogitsWarper = transformers_logits_process.LogitsProcessor
 
 JsonSchemaParser = None
 build_transformers_prefix_allowed_tokens_fn = None
