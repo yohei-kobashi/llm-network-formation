@@ -5,6 +5,15 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    from lmformatenforcer import JsonSchemaParser
+    from lmformatenforcer.integrations.transformers import (
+        build_transformers_prefix_allowed_tokens_fn,
+    )
+except ImportError:
+    JsonSchemaParser = None
+    build_transformers_prefix_allowed_tokens_fn = None
+
 
 MODELS = [
     "Qwen/Qwen3.5-0.8B",
@@ -17,6 +26,14 @@ MAX_NEW_TOKENS = 256
 TRIALS = 3
 
 _HF_CACHE = {}
+
+
+def require_lm_format_enforcer():
+    if JsonSchemaParser is None or build_transformers_prefix_allowed_tokens_fn is None:
+        raise RuntimeError(
+            "lm-format-enforcer is required for JSON schema constrained decoding. "
+            "In Colab, run: pip install lm-format-enforcer"
+        )
 
 
 def get_hf_client(model_id: str):
@@ -57,6 +74,9 @@ def build_candidates(name_mode: str = "int"):
 
 
 def build_prompt(candidates, environment=None, role="neighbors", cot=False):
+    allowed_names = [candidate["name"] for candidate in candidates]
+    allowed_names_json = json.dumps(allowed_names, ensure_ascii=False)
+
     if cot:
         output_format = """
 {
@@ -92,10 +112,14 @@ The output should be given in JSON format with the following structure
 
 # Notes
 
-* The name of the person you selected must be one of the names in the input.
-* Your output must be JSON only.
-
-```json
+* Return exactly one JSON object.
+* Do not explain your reasoning outside the JSON object.
+* Do not write markdown fences.
+* Do not write any text before or after the JSON object.
+* The value of "name" must be exactly one of these values: {allowed_names_json}
+* Do not rename the person.
+* Do not output labels such as "person 0", "Person 0", or "candidate 0".
+* Your first character must be {{ and your last character must be }}.
 """.strip()
 
 
@@ -111,21 +135,50 @@ def render_chat_input(tokenizer, prompt: str, use_system_prompt: bool):
     )
 
 
+def build_response_schema(candidate_names):
+    schema_name_enum = list(candidate_names)
+    schema_name_type = "integer" if all(isinstance(name, int) for name in candidate_names) else "string"
+
+    return {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": schema_name_type,
+                "enum": schema_name_enum,
+            },
+            "reason": {
+                "type": "string",
+            },
+        },
+        "required": ["name", "reason"],
+        "additionalProperties": False,
+    }
+
+
 def generate_raw_response(
     model_id: str,
     prompt: str,
     use_system_prompt: bool,
+    response_schema,
     temperature=None,
 ):
+    require_lm_format_enforcer()
     tokenizer, model = get_hf_client(model_id)
     rendered_input = render_chat_input(tokenizer, prompt, use_system_prompt)
     model_inputs = tokenizer(rendered_input, return_tensors="pt")
     device = next(model.parameters()).device
     model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
 
+    parser = JsonSchemaParser(response_schema)
+    prefix_allowed_tokens_fn = build_transformers_prefix_allowed_tokens_fn(
+        tokenizer,
+        parser,
+    )
+
     generation_kwargs = {
         "max_new_tokens": MAX_NEW_TOKENS,
         "pad_token_id": tokenizer.pad_token_id,
+        "prefix_allowed_tokens_fn": prefix_allowed_tokens_fn,
     }
     if temperature in (None, 0):
         generation_kwargs["do_sample"] = False
@@ -180,21 +233,51 @@ def first_json_object(text: str):
     return None
 
 
-def normalize_name(value: Any):
-    if isinstance(value, str) and re.fullmatch(r"-?\d+", value):
-        return int(value)
-    return value
+def normalize_name(value: Any, candidate_names):
+    if value in candidate_names:
+        return value
+
+    candidate_names_by_str = {str(name): name for name in candidate_names}
+
+    if isinstance(value, int):
+        return candidate_names_by_str.get(str(value))
+
+    if not isinstance(value, str):
+        return None
+
+    stripped = value.strip()
+    if stripped in candidate_names:
+        return stripped
+
+    if stripped in candidate_names_by_str:
+        return candidate_names_by_str[stripped]
+
+    patterns = [
+        r"(?i)^person\s+(-?\d+)$",
+        r"(?i)^candidate\s+(-?\d+)$",
+        r"(?i)^id[_\s-]?(-?\d+)$",
+    ]
+    for pattern in patterns:
+        match = re.fullmatch(pattern, stripped)
+        if match:
+            normalized = match.group(1)
+            if normalized in candidate_names_by_str:
+                return candidate_names_by_str[normalized]
+
+    return None
 
 
 def run_case(model_id: str, name_mode: str, use_system_prompt: bool):
     candidates = build_candidates(name_mode=name_mode)
     candidate_names = {candidate["name"] for candidate in candidates}
     prompt = build_prompt(candidates)
+    response_schema = build_response_schema(sorted(candidate_names, key=str))
 
     rendered_input, raw_text = generate_raw_response(
         model_id=model_id,
         prompt=prompt,
         use_system_prompt=use_system_prompt,
+        response_schema=response_schema,
         temperature=None,
     )
 
@@ -204,18 +287,22 @@ def run_case(model_id: str, name_mode: str, use_system_prompt: bool):
         "raw_text": raw_text,
         "parsed": parsed,
         "candidate_names": sorted(candidate_names, key=str),
+        "response_schema": response_schema,
         "accepted_by_original_logic": False,
-        "accepted_after_numeric_coercion": False,
+        "accepted_after_normalization": False,
         "name_type": None,
+        "normalized_name": None,
         "normalized_name_type": None,
     }
 
     if parsed is not None and isinstance(parsed, dict) and "name" in parsed:
         result["name_type"] = type(parsed["name"]).__name__
         result["accepted_by_original_logic"] = parsed["name"] in candidate_names
-        normalized_name = normalize_name(parsed["name"])
-        result["normalized_name_type"] = type(normalized_name).__name__
-        result["accepted_after_numeric_coercion"] = normalized_name in candidate_names
+        normalized_name = normalize_name(parsed["name"], candidate_names)
+        result["normalized_name"] = normalized_name
+        if normalized_name is not None:
+            result["normalized_name_type"] = type(normalized_name).__name__
+            result["accepted_after_normalization"] = normalized_name in candidate_names
 
     return rendered_input, result
 
@@ -226,11 +313,13 @@ def print_case_summary(model_id: str, name_mode: str, use_system_prompt: bool, t
     print(title)
     print("=" * len(title))
     print("candidate_names:", result["candidate_names"])
+    print("response_schema:", json.dumps(result["response_schema"], ensure_ascii=False))
     print("parse_ok:", result["parse_ok"])
     print("name_type:", result["name_type"])
+    print("normalized_name:", result["normalized_name"])
     print("normalized_name_type:", result["normalized_name_type"])
     print("accepted_by_original_logic:", result["accepted_by_original_logic"])
-    print("accepted_after_numeric_coercion:", result["accepted_after_numeric_coercion"])
+    print("accepted_after_normalization:", result["accepted_after_normalization"])
     print("rendered_input_preview:", rendered_input[:500].replace("\n", "\\n"))
     print("raw_text:")
     print(result["raw_text"])
@@ -240,8 +329,8 @@ def print_case_summary(model_id: str, name_mode: str, use_system_prompt: bool, t
 
 
 def main():
-    print("If Qwen fails only for integer candidate names but succeeds for string candidate names,")
-    print("the likely cause is that principle_1.ipynb rejects stringified numeric ids.")
+    print("This script uses JSON schema constrained decoding via lm-format-enforcer.")
+    print("If it is not installed in Colab, run: pip install lm-format-enforcer")
     print()
 
     cases = [
