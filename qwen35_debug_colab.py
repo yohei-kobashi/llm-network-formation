@@ -8,12 +8,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 JsonSchemaParser = None
 build_transformers_prefix_allowed_tokens_fn = None
-LMFE_IMPORT_ERROR = None
+LMFE_IMPORT_ERRORS = []
 
 try:
     from lmformatenforcer import JsonSchemaParser
 except Exception as exc:
-    LMFE_IMPORT_ERROR = exc
+    LMFE_IMPORT_ERRORS.append(("lmformatenforcer", repr(exc)))
 
 if JsonSchemaParser is not None:
     transformer_integration_paths = [
@@ -29,7 +29,7 @@ if JsonSchemaParser is not None:
             )
             break
         except Exception as exc:
-            LMFE_IMPORT_ERROR = exc
+            LMFE_IMPORT_ERRORS.append((module_path, repr(exc)))
 
 
 MODELS = [
@@ -47,10 +47,13 @@ _HF_CACHE = {}
 
 def require_lm_format_enforcer():
     if JsonSchemaParser is None or build_transformers_prefix_allowed_tokens_fn is None:
+        details = "; ".join(
+            f"{module_path}: {error_text}" for module_path, error_text in LMFE_IMPORT_ERRORS
+        )
         raise RuntimeError(
             "lm-format-enforcer is required for JSON schema constrained decoding. "
             "In Colab, run: pip install lm-format-enforcer. "
-            f"Import error: {repr(LMFE_IMPORT_ERROR)}"
+            f"Import attempts: {details}"
         )
 
 
