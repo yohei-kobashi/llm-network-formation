@@ -1,42 +1,14 @@
 import json
 import re
-import importlib
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.generation import logits_process as transformers_logits_process
-
-if (
-    not hasattr(transformers_logits_process, "LogitsWarper")
-    and hasattr(transformers_logits_process, "LogitsProcessor")
-):
-    transformers_logits_process.LogitsWarper = transformers_logits_process.LogitsProcessor
-
-JsonSchemaParser = None
-build_transformers_prefix_allowed_tokens_fn = None
-LMFE_IMPORT_ERRORS = []
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 try:
-    from lmformatenforcer import JsonSchemaParser
-except Exception as exc:
-    LMFE_IMPORT_ERRORS.append(("lmformatenforcer", repr(exc)))
-
-if JsonSchemaParser is not None:
-    transformer_integration_paths = [
-        "lmformatenforcer.integrations.transformers",
-        "lmformatenforcer.integrations.transformers_utils",
-    ]
-    for module_path in transformer_integration_paths:
-        try:
-            module = importlib.import_module(module_path)
-            build_transformers_prefix_allowed_tokens_fn = getattr(
-                module,
-                "build_transformers_prefix_allowed_tokens_fn",
-            )
-            break
-        except Exception as exc:
-            LMFE_IMPORT_ERRORS.append((module_path, repr(exc)))
+    import xgrammar as xgr
+except ImportError:
+    xgr = None
 
 
 MODELS = [
@@ -52,15 +24,11 @@ TRIALS = 3
 _HF_CACHE = {}
 
 
-def require_lm_format_enforcer():
-    if JsonSchemaParser is None or build_transformers_prefix_allowed_tokens_fn is None:
-        details = "; ".join(
-            f"{module_path}: {error_text}" for module_path, error_text in LMFE_IMPORT_ERRORS
-        )
+def require_xgrammar():
+    if xgr is None:
         raise RuntimeError(
-            "lm-format-enforcer is required for JSON schema constrained decoding. "
-            "In Colab, run: pip install lm-format-enforcer. "
-            f"Import attempts: {details}"
+            "xgrammar is required for JSON schema constrained decoding. "
+            "In Colab, run: pip install xgrammar"
         )
 
 
@@ -70,13 +38,14 @@ def get_hf_client(model_id: str):
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype="auto",
             device_map="auto",
             trust_remote_code=True,
         )
-        _HF_CACHE[model_id] = (tokenizer, model)
+        _HF_CACHE[model_id] = (tokenizer, model, config)
 
     return _HF_CACHE[model_id]
 
@@ -190,24 +159,29 @@ def generate_raw_response(
     response_schema,
     temperature=None,
 ):
-    require_lm_format_enforcer()
-    tokenizer, model = get_hf_client(model_id)
+    require_xgrammar()
+    tokenizer, model, config = get_hf_client(model_id)
     rendered_input = render_chat_input(tokenizer, prompt, use_system_prompt)
     model_inputs = tokenizer(rendered_input, return_tensors="pt")
     device = next(model.parameters()).device
     model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
 
-    parser = JsonSchemaParser(response_schema)
-    prefix_allowed_tokens_fn = build_transformers_prefix_allowed_tokens_fn(
+    tokenizer_info = xgr.TokenizerInfo.from_huggingface(
         tokenizer,
-        parser,
+        vocab_size=config.vocab_size,
     )
+    grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+    compiled_grammar = grammar_compiler.compile_json_schema(json.dumps(response_schema))
+    xgr_logits_processor = xgr.contrib.hf.LogitsProcessor(compiled_grammar)
 
     generation_kwargs = {
         "max_new_tokens": MAX_NEW_TOKENS,
         "pad_token_id": tokenizer.pad_token_id,
-        "prefix_allowed_tokens_fn": prefix_allowed_tokens_fn,
+        "logits_processor": [xgr_logits_processor],
     }
+    if tokenizer.eos_token_id is not None:
+        generation_kwargs["eos_token_id"] = tokenizer.eos_token_id
+
     if temperature in (None, 0):
         generation_kwargs["do_sample"] = False
     else:
@@ -357,8 +331,8 @@ def print_case_summary(model_id: str, name_mode: str, use_system_prompt: bool, t
 
 
 def main():
-    print("This script uses JSON schema constrained decoding via lm-format-enforcer.")
-    print("If it is not installed in Colab, run: pip install lm-format-enforcer")
+    print("This script uses JSON schema constrained decoding via xgrammar.")
+    print("If it is not installed in Colab, run: pip install xgrammar")
     print()
 
     cases = [
