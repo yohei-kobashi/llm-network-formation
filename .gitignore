@@ -170,3 +170,4 @@ outputs_simple/
 figures/
 figures-revised/
 powerlaw_tests/
+*.pdf
