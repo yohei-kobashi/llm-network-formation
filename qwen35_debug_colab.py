@@ -1,14 +1,11 @@
 import json
+import gc
 import re
 from typing import Any
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
-try:
-    import xgrammar as xgr
-except ImportError:
-    xgr = None
+from vllm import LLM, SamplingParams
+from vllm.sampling_params import StructuredOutputsParams
 
 
 MODELS = [
@@ -21,65 +18,32 @@ SYSTEM_PROMPT = "You are mimicking a real-life person who wants to make friends.
 MAX_NEW_TOKENS = 256
 TRIALS = 3
 
-_HF_CACHE = {}
+_VLLM_CACHE = {
+    "model_id": None,
+    "llm": None,
+    "tokenizer": None,
+}
 
 
-def require_xgrammar():
-    if xgr is None:
-        raise RuntimeError(
-            "xgrammar is required for JSON schema constrained decoding. "
-            "In Colab, run: pip install xgrammar"
-        )
+def get_vllm_client(model_id: str):
+    if _VLLM_CACHE["model_id"] != model_id:
+        _VLLM_CACHE["model_id"] = None
+        _VLLM_CACHE["llm"] = None
+        _VLLM_CACHE["tokenizer"] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-
-def get_hf_client(model_id: str):
-    if model_id not in _HF_CACHE:
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype="auto",
-            device_map="auto",
+        llm = LLM(
+            model=model_id,
             trust_remote_code=True,
+            dtype="auto",
         )
-        _HF_CACHE[model_id] = (tokenizer, model, config)
+        _VLLM_CACHE["model_id"] = model_id
+        _VLLM_CACHE["llm"] = llm
+        _VLLM_CACHE["tokenizer"] = llm.get_tokenizer()
 
-    return _HF_CACHE[model_id]
-
-
-def infer_vocab_size(tokenizer, model, config):
-    candidate_values = []
-
-    for attr in ("vocab_size",):
-        value = getattr(config, attr, None)
-        if isinstance(value, int) and value > 0:
-            candidate_values.append(("config.vocab_size", value))
-
-    value = getattr(tokenizer, "vocab_size", None)
-    if isinstance(value, int) and value > 0:
-        candidate_values.append(("tokenizer.vocab_size", value))
-
-    try:
-        vocab = tokenizer.get_vocab()
-        if isinstance(vocab, dict) and len(vocab) > 0:
-            candidate_values.append(("len(tokenizer.get_vocab())", len(vocab)))
-    except Exception:
-        pass
-
-    embedding_layer = model.get_input_embeddings()
-    if embedding_layer is not None and hasattr(embedding_layer, "num_embeddings"):
-        value = getattr(embedding_layer, "num_embeddings", None)
-        if isinstance(value, int) and value > 0:
-            candidate_values.append(("model.get_input_embeddings().num_embeddings", value))
-
-    if not candidate_values:
-        raise RuntimeError("Could not infer vocab_size from config, tokenizer, or model.")
-
-    source, vocab_size = max(candidate_values, key=lambda item: item[1])
-    return source, vocab_size, candidate_values
+    return _VLLM_CACHE["llm"], _VLLM_CACHE["tokenizer"]
 
 
 def build_candidates(name_mode: str = "int"):
@@ -157,11 +121,16 @@ def render_chat_input(tokenizer, prompt: str, use_system_prompt: bool):
     if use_system_prompt:
         messages.append({"role": "system", "content": SYSTEM_PROMPT})
     messages.append({"role": "user", "content": prompt})
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "enable_thinking": False,
+    }
+    try:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        return tokenizer.apply_chat_template(messages, **kwargs)
 
 
 def build_response_schema(candidate_names):
@@ -191,42 +160,25 @@ def generate_raw_response(
     response_schema,
     temperature=None,
 ):
-    require_xgrammar()
-    tokenizer, model, config = get_hf_client(model_id)
+    llm, tokenizer = get_vllm_client(model_id)
     rendered_input = render_chat_input(tokenizer, prompt, use_system_prompt)
-    model_inputs = tokenizer(rendered_input, return_tensors="pt")
-    device = next(model.parameters()).device
-    model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
 
-    vocab_size_source, vocab_size, vocab_size_candidates = infer_vocab_size(tokenizer, model, config)
-    print(f"[xgrammar] using vocab_size={vocab_size} from {vocab_size_source}")
-    print(f"[xgrammar] vocab size candidates: {vocab_size_candidates}")
-
-    tokenizer_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
-    grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
-    compiled_grammar = grammar_compiler.compile_json_schema(json.dumps(response_schema))
-    xgr_logits_processor = xgr.contrib.hf.LogitsProcessor(compiled_grammar)
-
-    generation_kwargs = {
-        "max_new_tokens": MAX_NEW_TOKENS,
-        "pad_token_id": tokenizer.pad_token_id,
-        "logits_processor": [xgr_logits_processor],
+    sampling_kwargs = {
+        "max_tokens": MAX_NEW_TOKENS,
+        "structured_outputs": StructuredOutputsParams(json=response_schema),
     }
-    if tokenizer.eos_token_id is not None:
-        generation_kwargs["eos_token_id"] = tokenizer.eos_token_id
-
     if temperature in (None, 0):
-        generation_kwargs["do_sample"] = False
+        sampling_kwargs["temperature"] = 0.0
     else:
-        generation_kwargs["do_sample"] = True
-        generation_kwargs["temperature"] = temperature
-        generation_kwargs["top_p"] = 0.95
+        sampling_kwargs["temperature"] = temperature
+        sampling_kwargs["top_p"] = 0.95
 
-    with torch.no_grad():
-        outputs = model.generate(**model_inputs, **generation_kwargs)
-
-    generated_tokens = outputs[0][model_inputs["input_ids"].shape[-1]:]
-    raw_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    outputs = llm.generate(
+        [rendered_input],
+        sampling_params=SamplingParams(**sampling_kwargs),
+        use_tqdm=False,
+    )
+    raw_text = outputs[0].outputs[0].text
     return rendered_input, raw_text
 
 
@@ -364,8 +316,8 @@ def print_case_summary(model_id: str, name_mode: str, use_system_prompt: bool, t
 
 
 def main():
-    print("This script uses JSON schema constrained decoding via xgrammar.")
-    print("If it is not installed in Colab, run: pip install xgrammar")
+    print("This script uses vLLM structured output with a JSON schema.")
+    print("If it is not installed in Colab, run: pip install vllm")
     print()
 
     cases = [

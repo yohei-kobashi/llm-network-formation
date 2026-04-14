@@ -7,6 +7,7 @@ import random
 import os
 import copy
 import collections 
+import gc
 import scipy.stats as stats
 import netgraph
 import powerlaw as pwl
@@ -15,12 +16,14 @@ import replicate
 import anthropic
 import torch
 from openai import OpenAI
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 try:
-    import xgrammar as xgr
+    from vllm import LLM, SamplingParams
+    from vllm.sampling_params import StructuredOutputsParams
 except ImportError:
-    xgr = None
+    LLM = None
+    SamplingParams = None
+    StructuredOutputsParams = None
 
 def _get_required_env(name):
     value = os.getenv(name)
@@ -37,7 +40,11 @@ openai_client = OpenAI(
     api_key=_get_required_env('OPENAI_API_KEY'),
     organization=os.getenv('OPENAI_ORG'),
 )
-hf_clients = {}
+vllm_client = {
+    'model': None,
+    'llm': None,
+    'tokenizer': None,
+}
 
 def set_plot_sizes():
 
@@ -54,62 +61,43 @@ def set_plot_sizes():
     plt.rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
 
 
-def _get_huggingface_client(model):
-    if model not in hf_clients:
-        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        config = AutoConfig.from_pretrained(model, trust_remote_code=True)
-
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model,
-            torch_dtype="auto",
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        hf_clients[model] = (tokenizer, hf_model, config)
-
-    return hf_clients[model]
-
-
-def _require_xgrammar():
-    if xgr is None:
+def _require_vllm():
+    if LLM is None or SamplingParams is None or StructuredOutputsParams is None:
         raise RuntimeError(
-            "xgrammar is required for JSON schema constrained decoding. "
-            "In Colab, run: pip install xgrammar"
+            "vLLM is required for Qwen local inference with structured output. "
+            "In Colab, run: pip install vllm"
         )
 
 
-def _infer_vocab_size(tokenizer, model, config):
-    candidate_values = []
+def _get_vllm_client(model):
+    _require_vllm()
 
-    value = getattr(config, "vocab_size", None)
-    if isinstance(value, int) and value > 0:
-        candidate_values.append(("config.vocab_size", value))
+    if vllm_client['model'] != model:
+        vllm_client['model'] = None
+        vllm_client['llm'] = None
+        vllm_client['tokenizer'] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    value = getattr(tokenizer, "vocab_size", None)
-    if isinstance(value, int) and value > 0:
-        candidate_values.append(("tokenizer.vocab_size", value))
+        llm_kwargs = {
+            'model': model,
+            'trust_remote_code': True,
+            'dtype': 'auto',
+        }
+        if os.getenv('VLLM_GPU_MEMORY_UTILIZATION'):
+            llm_kwargs['gpu_memory_utilization'] = float(os.getenv('VLLM_GPU_MEMORY_UTILIZATION'))
+        if os.getenv('VLLM_MAX_MODEL_LEN'):
+            llm_kwargs['max_model_len'] = int(os.getenv('VLLM_MAX_MODEL_LEN'))
+        if os.getenv('VLLM_TENSOR_PARALLEL_SIZE'):
+            llm_kwargs['tensor_parallel_size'] = int(os.getenv('VLLM_TENSOR_PARALLEL_SIZE'))
 
-    try:
-        vocab = tokenizer.get_vocab()
-        if isinstance(vocab, dict) and len(vocab) > 0:
-            candidate_values.append(("len(tokenizer.get_vocab())", len(vocab)))
-    except Exception:
-        pass
+        llm = LLM(**llm_kwargs)
+        vllm_client['model'] = model
+        vllm_client['llm'] = llm
+        vllm_client['tokenizer'] = llm.get_tokenizer()
 
-    embedding_layer = model.get_input_embeddings()
-    if embedding_layer is not None and hasattr(embedding_layer, "num_embeddings"):
-        value = getattr(embedding_layer, "num_embeddings", None)
-        if isinstance(value, int) and value > 0:
-            candidate_values.append(("model.get_input_embeddings().num_embeddings", value))
-
-    if not candidate_values:
-        raise RuntimeError("Could not infer vocab_size from config, tokenizer, or model.")
-
-    source, vocab_size = max(candidate_values, key=lambda item: item[1])
-    return source, vocab_size
+    return vllm_client['llm'], vllm_client['tokenizer']
 
 
 def is_huggingface_model_supported(model):
@@ -165,43 +153,6 @@ def resolve_cot_config(model, cot=False, cot_config=None):
     elif _is_qwen_thinking_model(model):
         config['qwen_enable_thinking'] = bool(cot)
 
-        if _is_qwen35_model(model):
-            if cot:
-                config.update({
-                    'temperature': 1.0,
-                    'top_p': 0.95,
-                    'top_k': 20,
-                    'min_p': 0.0,
-                    'repetition_penalty': 1.0,
-                    'max_new_tokens': 2000,
-                })
-            else:
-                config.update({
-                    'temperature': 0.7,
-                    'top_p': 0.8,
-                    'top_k': 20,
-                    'min_p': 0.0,
-                    'repetition_penalty': 1.0,
-                    'max_new_tokens': 1000,
-                })
-        else:
-            if cot:
-                config.update({
-                    'temperature': 0.6,
-                    'top_p': 0.95,
-                    'top_k': 20,
-                    'min_p': 0.0,
-                    'max_new_tokens': 2000,
-                })
-            else:
-                config.update({
-                    'temperature': 0.7,
-                    'top_p': 0.8,
-                    'top_k': 20,
-                    'min_p': 0.0,
-                    'max_new_tokens': 1000,
-                })
-
     if cot_config:
         config.update(cot_config)
 
@@ -230,85 +181,80 @@ def _strip_qwen_thinking(text):
     return text
 
 
-def _compile_response_grammar(grammar_compiler, response_schema, qwen_thinking_enabled):
-    if qwen_thinking_enabled:
-        if not hasattr(grammar_compiler, 'compile_structural_tag'):
-            raise RuntimeError(
-                "Qwen thinking with structured output requires xgrammar.compile_structural_tag. "
-                "Upgrade xgrammar or run Qwen with cot=False for schema-constrained output."
-            )
+def _build_vllm_sampling_params(temperature, cot_config, response_schema=None):
+    sampling_kwargs = {
+        'max_tokens': cot_config.get('max_new_tokens', 1000),
+    }
 
-        structural_tag = {
-            'type': 'structural_tag',
-            'format': {
-                'type': 'sequence',
-                'elements': [
-                    {
-                        'type': 'tag',
-                        'begin': '<think>',
-                        'content': {'type': 'any_text'},
-                        'end': '</think>',
-                    },
-                    {
-                        'type': 'regex',
-                        'pattern': r'\s*',
-                    },
-                    {
-                        'type': 'json_schema',
-                        'json_schema': response_schema,
-                    },
-                ],
-            },
-        }
-        return grammar_compiler.compile_structural_tag(structural_tag)
+    if temperature is None and 'temperature' in cot_config:
+        temperature = cot_config['temperature']
 
-    return grammar_compiler.compile_json_schema(json.dumps(response_schema))
+    if temperature in (None, 0):
+        sampling_kwargs['temperature'] = 0.0
+    else:
+        sampling_kwargs['temperature'] = temperature
+
+    for key in ('top_p', 'top_k', 'min_p', 'repetition_penalty'):
+        if key in cot_config:
+            sampling_kwargs[key] = cot_config[key]
+
+    if response_schema is not None:
+        sampling_kwargs['structured_outputs'] = StructuredOutputsParams(json=response_schema)
+
+    return SamplingParams(**sampling_kwargs)
 
 
-def _get_huggingface_response(prompt, model, temperature, system_prompt, response_schema=None, cot=False, cot_config=None):
-    tokenizer, hf_model, config = _get_huggingface_client(model)
+def _get_vllm_response(prompt, model, temperature, system_prompt, response_schema=None, cot=False, cot_config=None):
+    llm, tokenizer = _get_vllm_client(model)
     cot_config = resolve_cot_config(model, cot=cot, cot_config=cot_config)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
     input_text = _apply_chat_template(tokenizer, messages, cot_config)
-    model_inputs = tokenizer(input_text, return_tensors="pt")
-    device = next(hf_model.parameters()).device
-    model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
-
-    generation_kwargs = {
-        "max_new_tokens": cot_config.get('max_new_tokens', 1000),
-        "pad_token_id": tokenizer.pad_token_id,
-    }
     qwen_thinking_enabled = cot_config.get('qwen_enable_thinking') is True
-    if response_schema is not None:
-        _require_xgrammar()
-        vocab_size_source, vocab_size = _infer_vocab_size(tokenizer, hf_model, config)
-        print(f"[xgrammar] using vocab_size={vocab_size} from {vocab_size_source}")
-        tokenizer_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
-        grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
-        compiled_grammar = _compile_response_grammar(grammar_compiler, response_schema, qwen_thinking_enabled)
-        generation_kwargs["logits_processor"] = [xgr.contrib.hf.LogitsProcessor(compiled_grammar)]
+    sampling_params = _build_vllm_sampling_params(
+        temperature,
+        cot_config,
+        response_schema=response_schema,
+    )
 
-    temperature = cot_config.get('temperature', temperature)
-    if temperature in (None, 0):
-        generation_kwargs["do_sample"] = False
-    else:
-        generation_kwargs["do_sample"] = True
-        generation_kwargs["temperature"] = temperature
-        generation_kwargs["top_p"] = cot_config.get('top_p', 0.95)
-
-    for key in ('top_k', 'min_p', 'repetition_penalty'):
-        if key in cot_config:
-            generation_kwargs[key] = cot_config[key]
-
-    outputs = hf_model.generate(**model_inputs, **generation_kwargs)
-    generated_tokens = outputs[0][model_inputs["input_ids"].shape[-1]:]
-    text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    outputs = llm.generate([input_text], sampling_params=sampling_params, use_tqdm=False)
+    text = outputs[0].outputs[0].text
     if qwen_thinking_enabled:
         text = _strip_qwen_thinking(text)
     return text
+
+
+def _get_vllm_responses(prompts, model, temperature, system_prompt, response_schemas=None, cot=False, cot_config=None):
+    llm, tokenizer = _get_vllm_client(model)
+    cot_config = resolve_cot_config(model, cot=cot, cot_config=cot_config)
+    if response_schemas is None:
+        response_schemas = [None] * len(prompts)
+    elif len(response_schemas) != len(prompts):
+        raise ValueError("response_schemas must be None or the same length as prompts.")
+
+    input_texts = []
+    sampling_params = []
+    for prompt, response_schema in zip(prompts, response_schemas):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        input_texts.append(_apply_chat_template(tokenizer, messages, cot_config))
+        sampling_params.append(
+            _build_vllm_sampling_params(
+                temperature,
+                cot_config,
+                response_schema=response_schema,
+            )
+        )
+
+    outputs = llm.generate(input_texts, sampling_params=sampling_params, use_tqdm=False)
+    texts = [output.outputs[0].text for output in outputs]
+    if cot_config.get('qwen_enable_thinking') is True:
+        texts = [_strip_qwen_thinking(text) for text in texts]
+    return texts
 
 
 def get_response(prompt, model, temperature=0.9, system_prompt="You are mimicking a real-life person who wants to make friends.", response_schema=None, cot=False, cot_config=None):
@@ -347,7 +293,7 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
         
         return result.content[0].text
     elif model.startswith('Qwen/'):
-        return _get_huggingface_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+        return _get_vllm_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
     else:
         global replicate_client
         replicate_input = {
@@ -359,6 +305,21 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
         result = replicate_client.run(model, replicate_input)
 
         return ''.join(result)
+
+
+def get_responses(prompts, model, temperature=0.9, system_prompt="You are mimicking a real-life person who wants to make friends.", response_schemas=None, cot=False, cot_config=None):
+    if model.startswith('Qwen/'):
+        return _get_vllm_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+
+    if response_schemas is None:
+        response_schemas = [None] * len(prompts)
+    elif len(response_schemas) != len(prompts):
+        raise ValueError("response_schemas must be None or the same length as prompts.")
+
+    return [
+        get_response(prompt, model, temperature=temperature, system_prompt=system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+        for prompt, response_schema in zip(prompts, response_schemas)
+    ]
 
 def summarize_reasons(filename, model, outfile, title, n_samples=20, n_categories=5, n_resamples=5, degrees=False, categories=None):
     random.seed(1)
