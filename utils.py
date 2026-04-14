@@ -20,11 +20,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     from vllm import LLM, SamplingParams
-    from vllm.sampling_params import StructuredOutputsParams
-except ImportError:
+    vllm_import_error = None
+except Exception as e:
     LLM = None
     SamplingParams = None
+    vllm_import_error = e
+
+try:
+    from vllm.sampling_params import StructuredOutputsParams
+    structured_outputs_import_error = None
+except Exception as e:
     StructuredOutputsParams = None
+    structured_outputs_import_error = e
 
 def _get_required_env(name):
     value = os.getenv(name)
@@ -47,6 +54,7 @@ vllm_client = {
     'tokenizer': None,
 }
 vllm_unavailable_models = set()
+vllm_schema_warning_models = set()
 transformers_schema_warning_models = set()
 hf_clients = {}
 
@@ -66,10 +74,12 @@ def set_plot_sizes():
 
 
 def _require_vllm():
-    if LLM is None or SamplingParams is None or StructuredOutputsParams is None:
+    if LLM is None or SamplingParams is None:
+        detail = f" Import error: {vllm_import_error}" if vllm_import_error else ""
         raise RuntimeError(
             "vLLM is required for Qwen local inference with structured output. "
-            "In Colab, run: pip install vllm"
+            "In Colab, run the repository setup cell and restart the runtime if vLLM was just installed."
+            f"{detail}"
         )
 
 
@@ -131,6 +141,11 @@ def _get_transformers_client(model):
 
 
 def is_huggingface_model_supported(model):
+    if model.startswith('Qwen/') and LLM is None:
+        detail = f" Import error: {vllm_import_error}" if vllm_import_error else ""
+        print(f"Skipping {model}: vLLM is not importable in this runtime.{detail}")
+        return False
+
     return True
 
 
@@ -229,7 +244,14 @@ def _build_vllm_sampling_params(temperature, cot_config, response_schema=None):
             sampling_kwargs[key] = cot_config[key]
 
     if response_schema is not None:
-        sampling_kwargs['structured_outputs'] = StructuredOutputsParams(json=response_schema)
+        if StructuredOutputsParams is None:
+            model_key = cot_config.get('model_name', 'unknown')
+            if model_key not in vllm_schema_warning_models:
+                detail = f" Import error: {structured_outputs_import_error}" if structured_outputs_import_error else ""
+                print(f"[vLLM] StructuredOutputsParams is unavailable; response_schema will not be enforced.{detail}")
+                vllm_schema_warning_models.add(model_key)
+        else:
+            sampling_kwargs['structured_outputs'] = StructuredOutputsParams(json=response_schema)
 
     return SamplingParams(**sampling_kwargs)
 

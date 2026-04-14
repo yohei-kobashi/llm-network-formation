@@ -1,15 +1,16 @@
 matplotlib
 networkx
-numpy
+numpy==2.0.2
 pandas
-scipy
+scipy==1.14.1
 seaborn
 netgraph
 powerlaw
 openai
 anthropic
 replicate
-transformers[serving] @ git+https://github.com/huggingface/transformers.git@main
+git+https://github.com/huggingface/transformers.git
 torch
 accelerate
+sentencepiece
 vllm
