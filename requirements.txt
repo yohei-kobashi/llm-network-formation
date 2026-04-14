@@ -1,3 +1,6 @@
+--pre
+--extra-index-url https://wheels.vllm.ai/nightly
+
 matplotlib
 networkx
 numpy

@@ -16,6 +16,7 @@ import replicate
 import anthropic
 import torch
 from openai import OpenAI
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     from vllm import LLM, SamplingParams
@@ -45,6 +46,9 @@ vllm_client = {
     'llm': None,
     'tokenizer': None,
 }
+vllm_unavailable_models = set()
+transformers_schema_warning_models = set()
+hf_clients = {}
 
 def set_plot_sizes():
 
@@ -72,6 +76,9 @@ def _require_vllm():
 def _get_vllm_client(model):
     _require_vllm()
 
+    if model in vllm_unavailable_models:
+        raise RuntimeError(f"vLLM is unavailable for {model}; using Transformers fallback.")
+
     if vllm_client['model'] != model:
         vllm_client['model'] = None
         vllm_client['llm'] = None
@@ -92,12 +99,35 @@ def _get_vllm_client(model):
         if os.getenv('VLLM_TENSOR_PARALLEL_SIZE'):
             llm_kwargs['tensor_parallel_size'] = int(os.getenv('VLLM_TENSOR_PARALLEL_SIZE'))
 
-        llm = LLM(**llm_kwargs)
+        try:
+            llm = LLM(**llm_kwargs)
+        except Exception:
+            vllm_unavailable_models.add(model)
+            raise
         vllm_client['model'] = model
         vllm_client['llm'] = llm
         vllm_client['tokenizer'] = llm.get_tokenizer()
 
     return vllm_client['llm'], vllm_client['tokenizer']
+
+
+def _get_transformers_client(model):
+    if model not in hf_clients:
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
+
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model,
+            torch_dtype="auto",
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        hf_model.eval()
+        hf_clients[model] = (tokenizer, hf_model)
+
+    return hf_clients[model]
 
 
 def is_huggingface_model_supported(model):
@@ -226,6 +256,18 @@ def _get_vllm_response(prompt, model, temperature, system_prompt, response_schem
     return text
 
 
+def _get_transformers_response(prompt, model, temperature, system_prompt, response_schema=None, cot=False, cot_config=None):
+    return _get_transformers_responses(
+        [prompt],
+        model,
+        temperature,
+        system_prompt,
+        response_schemas=[response_schema] if response_schema is not None else None,
+        cot=cot,
+        cot_config=cot_config,
+    )[0]
+
+
 def _get_vllm_responses(prompts, model, temperature, system_prompt, response_schemas=None, cot=False, cot_config=None):
     llm, tokenizer = _get_vllm_client(model)
     cot_config = resolve_cot_config(model, cot=cot, cot_config=cot_config)
@@ -254,6 +296,62 @@ def _get_vllm_responses(prompts, model, temperature, system_prompt, response_sch
     texts = [output.outputs[0].text for output in outputs]
     if cot_config.get('qwen_enable_thinking') is True:
         texts = [_strip_qwen_thinking(text) for text in texts]
+    return texts
+
+
+def _get_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=None, cot=False, cot_config=None):
+    tokenizer, hf_model = _get_transformers_client(model)
+    cot_config = resolve_cot_config(model, cot=cot, cot_config=cot_config)
+    input_texts = []
+    for prompt in prompts:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        input_texts.append(_apply_chat_template(tokenizer, messages, cot_config))
+
+    model_inputs = tokenizer(input_texts, return_tensors="pt", padding=True)
+    device = next(hf_model.parameters()).device
+    model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+
+    generation_kwargs = {
+        "max_new_tokens": cot_config.get('max_new_tokens', 1000),
+        "pad_token_id": tokenizer.pad_token_id,
+    }
+
+    if temperature is None and 'temperature' in cot_config:
+        temperature = cot_config['temperature']
+
+    if temperature in (None, 0):
+        generation_kwargs["do_sample"] = False
+    else:
+        generation_kwargs["do_sample"] = True
+        generation_kwargs["temperature"] = temperature
+
+    for key in ('top_p', 'top_k', 'min_p', 'repetition_penalty'):
+        if key in cot_config:
+            generation_kwargs[key] = cot_config[key]
+
+    if (
+        response_schemas
+        and any(schema is not None for schema in response_schemas)
+        and model not in transformers_schema_warning_models
+    ):
+        print(f"[transformers fallback] response_schema is not enforced for {model}; relying on prompt instructions.")
+        transformers_schema_warning_models.add(model)
+
+    with torch.inference_mode():
+        outputs = hf_model.generate(**model_inputs, **generation_kwargs)
+
+    input_length = model_inputs["input_ids"].shape[-1]
+    texts = []
+    for output in outputs:
+        generated_tokens = output[input_length:]
+        text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        if cot_config.get('qwen_enable_thinking') is True:
+            text = _strip_qwen_thinking(text)
+        texts.append(text)
+
     return texts
 
 
@@ -293,7 +391,14 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
         
         return result.content[0].text
     elif model.startswith('Qwen/'):
-        return _get_vllm_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+        if model in vllm_unavailable_models:
+            return _get_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+        try:
+            return _get_vllm_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+        except Exception as e:
+            print(f"[vLLM fallback] {model} failed to load or generate with vLLM: {str(e).splitlines()[0]}")
+            print(f"[vLLM fallback] Retrying {model} with Transformers.")
+            return _get_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
     else:
         global replicate_client
         replicate_input = {
@@ -309,7 +414,14 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
 
 def get_responses(prompts, model, temperature=0.9, system_prompt="You are mimicking a real-life person who wants to make friends.", response_schemas=None, cot=False, cot_config=None):
     if model.startswith('Qwen/'):
-        return _get_vllm_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+        if model in vllm_unavailable_models:
+            return _get_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+        try:
+            return _get_vllm_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+        except Exception as e:
+            print(f"[vLLM fallback] {model} failed to load or generate with vLLM: {str(e).splitlines()[0]}")
+            print(f"[vLLM fallback] Retrying {model} with Transformers.")
+            return _get_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
 
     if response_schemas is None:
         response_schemas = [None] * len(prompts)
