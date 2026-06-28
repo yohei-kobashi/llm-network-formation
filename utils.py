@@ -8,6 +8,7 @@ import os
 import copy
 import collections 
 import gc
+import math
 import scipy.stats as stats
 import netgraph
 import powerlaw as pwl
@@ -56,6 +57,7 @@ vllm_client = {
 vllm_unavailable_models = set()
 vllm_schema_warning_models = set()
 transformers_schema_warning_models = set()
+transformers_unavailable_models = set()
 hf_clients = {}
 
 def set_plot_sizes():
@@ -122,7 +124,11 @@ def _get_vllm_client(model):
 
 
 def _get_transformers_client(model):
+    if model in transformers_unavailable_models:
+        raise RuntimeError(f"Transformers fallback is unavailable for {model}.")
+
     if model not in hf_clients:
+        print(f"[transformers fallback] Loading {model}...", flush=True)
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -136,15 +142,50 @@ def _get_transformers_client(model):
         )
         hf_model.eval()
         hf_clients[model] = (tokenizer, hf_model)
+        print(f"[transformers fallback] Loaded {model}.", flush=True)
 
     return hf_clients[model]
+
+
+def _try_transformers_response(prompt, model, temperature, system_prompt, response_schema=None, cot=False, cot_config=None):
+    try:
+        return _get_transformers_response(
+            prompt,
+            model,
+            temperature,
+            system_prompt,
+            response_schema=response_schema,
+            cot=cot,
+            cot_config=cot_config,
+        )
+    except Exception as e:
+        transformers_unavailable_models.add(model)
+        print(f"[transformers fallback] {model} is unavailable: {str(e).splitlines()[0]}")
+        return None
+
+
+def _try_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=None, cot=False, cot_config=None):
+    try:
+        return _get_transformers_responses(
+            prompts,
+            model,
+            temperature,
+            system_prompt,
+            response_schemas=response_schemas,
+            cot=cot,
+            cot_config=cot_config,
+        )
+    except Exception as e:
+        transformers_unavailable_models.add(model)
+        print(f"[transformers fallback] {model} is unavailable: {str(e).splitlines()[0]}")
+        return [None] * len(prompts)
 
 
 def is_huggingface_model_supported(model):
     if model.startswith('Qwen/') and LLM is None:
         detail = f" Import error: {vllm_import_error}" if vllm_import_error else ""
-        print(f"Skipping {model}: vLLM is not importable in this runtime.{detail}")
-        return False
+        print(f"vLLM is not importable in this runtime for {model}; using Transformers fallback.{detail}")
+        return True
 
     return True
 
@@ -220,10 +261,122 @@ def _apply_chat_template(tokenizer, messages, cot_config):
 
 
 def _strip_qwen_thinking(text):
+    final_marker = 'FINAL_JSON:'
+    if final_marker in text:
+        return text.rsplit(final_marker, 1)[1].strip()
     end_tag = '</think>'
     if end_tag in text:
-        return text.split(end_tag, 1)[1].strip()
+        text = text.split(end_tag, 1)[1].strip()
+        if final_marker in text:
+            return text.rsplit(final_marker, 1)[1].strip()
+        return text
     return text
+
+
+def find_first_json_object_end(text, require_name=True):
+    """Return the character offset after the first parseable JSON object."""
+    if text is None:
+        return None
+
+    decoder = json.JSONDecoder()
+    candidates = []
+    final_marker = 'FINAL_JSON:'
+    if final_marker in text:
+        marker_start = text.rfind(final_marker)
+        marker_text = text[marker_start + len(final_marker):]
+        for match_offset, char in enumerate(marker_text):
+            if char == '{':
+                candidates.append(marker_start + len(final_marker) + match_offset)
+
+    candidates.extend(i for i, char in enumerate(text) if char == '{')
+    seen = set()
+    for start in candidates:
+        if start in seen:
+            continue
+        seen.add(start)
+        try:
+            value, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and (not require_name or 'name' in value):
+            return start + end
+    return None
+
+
+def count_text_tokens(text, tokenizer=None):
+    if text is None:
+        return 0
+    if tokenizer is not None:
+        try:
+            return len(tokenizer.encode(text, add_special_tokens=False))
+        except TypeError:
+            return len(tokenizer.encode(text))
+    return max(1, math.ceil(len(text) / 4))
+
+
+def summarize_generation_budget_calibration(
+    outputs,
+    tokenizer=None,
+    parse_successes=None,
+    percentile=0.90,
+    margin=1.5,
+    buckets=(8192, 16384, 32768, 65536),
+    minimum_budget=8192,
+):
+    records = []
+    final_positions = []
+    if parse_successes is None:
+        parse_successes = [None] * len(outputs)
+
+    for i, (text, parse_success) in enumerate(zip(outputs, parse_successes)):
+        text = '' if text is None else str(text)
+        json_end_char = find_first_json_object_end(text)
+        inferred_success = json_end_char is not None
+        is_success = inferred_success if parse_success is None else bool(parse_success)
+        generated_tokens = count_text_tokens(text, tokenizer=tokenizer)
+        final_json_position_tokens = (
+            count_text_tokens(text[:json_end_char], tokenizer=tokenizer)
+            if json_end_char is not None
+            else None
+        )
+
+        record = {
+            'index': i,
+            'parse_success': is_success,
+            'generated_tokens': generated_tokens,
+            'final_json_position_tokens': final_json_position_tokens,
+            'json_found': inferred_success,
+            'output_chars': len(text),
+        }
+        records.append(record)
+        if is_success and final_json_position_tokens is not None:
+            final_positions.append(final_json_position_tokens)
+
+    if final_positions:
+        threshold = float(np.quantile(final_positions, percentile)) * margin
+        selected_budget = max(minimum_budget, int(math.ceil(threshold)))
+        for bucket in sorted(buckets):
+            if selected_budget <= bucket:
+                selected_budget = bucket
+                break
+        else:
+            selected_budget = max(buckets)
+    else:
+        threshold = None
+        selected_budget = max(buckets)
+
+    summary = {
+        'selected_max_new_tokens': selected_budget,
+        'percentile': percentile,
+        'margin': margin,
+        'threshold_tokens': threshold,
+        'num_outputs': len(records),
+        'num_parse_success': sum(1 for record in records if record['parse_success']),
+        'num_json_found': sum(1 for record in records if record['json_found']),
+        'final_json_position_tokens': final_positions,
+        'records': records,
+    }
+    return summary
 
 
 def _build_vllm_sampling_params(temperature, cot_config, response_schema=None):
@@ -273,7 +426,7 @@ def _get_vllm_response(prompt, model, temperature, system_prompt, response_schem
 
     outputs = llm.generate([input_text], sampling_params=sampling_params, use_tqdm=False)
     text = outputs[0].outputs[0].text
-    if qwen_thinking_enabled:
+    if qwen_thinking_enabled and cot_config.get('strip_qwen_thinking', True):
         text = _strip_qwen_thinking(text)
     return text
 
@@ -316,7 +469,7 @@ def _get_vllm_responses(prompts, model, temperature, system_prompt, response_sch
 
     outputs = llm.generate(input_texts, sampling_params=sampling_params, use_tqdm=False)
     texts = [output.outputs[0].text for output in outputs]
-    if cot_config.get('qwen_enable_thinking') is True:
+    if cot_config.get('qwen_enable_thinking') is True and cot_config.get('strip_qwen_thinking', True):
         texts = [_strip_qwen_thinking(text) for text in texts]
     return texts
 
@@ -324,6 +477,11 @@ def _get_vllm_responses(prompts, model, temperature, system_prompt, response_sch
 def _get_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=None, cot=False, cot_config=None):
     tokenizer, hf_model = _get_transformers_client(model)
     cot_config = resolve_cot_config(model, cot=cot, cot_config=cot_config)
+    print(
+        f"[transformers fallback] Generating {len(prompts)} response(s) for {model} "
+        f"with max_new_tokens={cot_config.get('max_new_tokens', 1000)}...",
+        flush=True,
+    )
     input_texts = []
     for prompt in prompts:
         messages = [
@@ -364,13 +522,14 @@ def _get_transformers_responses(prompts, model, temperature, system_prompt, resp
 
     with torch.inference_mode():
         outputs = hf_model.generate(**model_inputs, **generation_kwargs)
+    print(f"[transformers fallback] Finished generation for {model}.", flush=True)
 
     input_length = model_inputs["input_ids"].shape[-1]
     texts = []
     for output in outputs:
         generated_tokens = output[input_length:]
         text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        if cot_config.get('qwen_enable_thinking') is True:
+        if cot_config.get('qwen_enable_thinking') is True and cot_config.get('strip_qwen_thinking', True):
             text = _strip_qwen_thinking(text)
         texts.append(text)
 
@@ -414,13 +573,14 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
         return result.content[0].text
     elif model.startswith('Qwen/'):
         if model in vllm_unavailable_models:
-            return _get_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+            return _try_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
         try:
             return _get_vllm_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
         except Exception as e:
+            vllm_unavailable_models.add(model)
             print(f"[vLLM fallback] {model} failed to load or generate with vLLM: {str(e).splitlines()[0]}")
             print(f"[vLLM fallback] Retrying {model} with Transformers.")
-            return _get_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+            return _try_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
     else:
         global replicate_client
         replicate_input = {
@@ -437,13 +597,14 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
 def get_responses(prompts, model, temperature=0.9, system_prompt="You are mimicking a real-life person who wants to make friends.", response_schemas=None, cot=False, cot_config=None):
     if model.startswith('Qwen/'):
         if model in vllm_unavailable_models:
-            return _get_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+            return _try_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
         try:
             return _get_vllm_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
         except Exception as e:
+            vllm_unavailable_models.add(model)
             print(f"[vLLM fallback] {model} failed to load or generate with vLLM: {str(e).splitlines()[0]}")
             print(f"[vLLM fallback] Retrying {model} with Transformers.")
-            return _get_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+            return _try_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
 
     if response_schemas is None:
         response_schemas = [None] * len(prompts)
