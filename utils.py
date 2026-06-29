@@ -60,6 +60,26 @@ transformers_schema_warning_models = set()
 transformers_unavailable_models = set()
 hf_clients = {}
 
+SHARED_BASELINE_MODEL = 'Qwen/Qwen3.5-4B'
+SHARED_MODEL_NAMES = [
+    'gpt-5-nano',
+    'Qwen/Qwen3.5-4B',
+    'Qwen/Qwen3.5-0.8B',
+]
+SHARED_DEFAULT_TEMPERATURES = [None]
+SHARED_DEFAULT_COT_CONFIG = {'max_new_tokens': 16384, 'qwen_enable_thinking': True}
+SHARED_COT_RETRY_MAX_NEW_TOKENS = 32768
+
+
+def get_shared_experiment_settings():
+    return {
+        'BASELINE_MODEL': SHARED_BASELINE_MODEL,
+        'MODEL_NAMES': list(SHARED_MODEL_NAMES),
+        'DEFAULT_TEMPERATURES': list(SHARED_DEFAULT_TEMPERATURES),
+        'DEFAULT_COT_CONFIG': dict(SHARED_DEFAULT_COT_CONFIG) if SHARED_DEFAULT_COT_CONFIG is not None else None,
+        'COT_RETRY_MAX_NEW_TOKENS': SHARED_COT_RETRY_MAX_NEW_TOKENS,
+    }
+
 
 def _get_openai_client():
     global openai_client
