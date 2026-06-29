@@ -45,10 +45,7 @@ replicate_api_token = os.getenv('REPLICATE_API_KEY')
 
 claude_client = anthropic.Anthropic(api_key=claude_api_key) if claude_api_key else None
 replicate_client = replicate.Client(api_token=replicate_api_token) if replicate_api_token else None
-openai_client = OpenAI(
-    api_key=_get_required_env('OPENAI_API_KEY'),
-    organization=os.getenv('OPENAI_ORG'),
-)
+openai_client = None
 vllm_client = {
     'model': None,
     'llm': None,
@@ -59,6 +56,16 @@ vllm_schema_warning_models = set()
 transformers_schema_warning_models = set()
 transformers_unavailable_models = set()
 hf_clients = {}
+
+
+def _get_openai_client():
+    global openai_client
+    if openai_client is None:
+        openai_client = OpenAI(
+            api_key=_get_required_env('OPENAI_API_KEY'),
+            organization=os.getenv('OPENAI_ORG'),
+        )
+    return openai_client
 
 def set_plot_sizes():
 
@@ -539,6 +546,7 @@ def _get_transformers_responses(prompts, model, temperature, system_prompt, resp
 def get_response(prompt, model, temperature=0.9, system_prompt="You are mimicking a real-life person who wants to make friends.", response_schema=None, cot=False, cot_config=None):
     cot_config = resolve_cot_config(model, cot=cot, cot_config=cot_config)
     if model.startswith('gpt'):
+        client = _get_openai_client()
         request_kwargs = {
             "model": model,
             "instructions": system_prompt,
@@ -549,7 +557,7 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
         if temperature is not None and not model.startswith('gpt-5'):
             request_kwargs["temperature"] = temperature
 
-        result = openai_client.responses.create(**request_kwargs)
+        result = client.responses.create(**request_kwargs)
         return result.output_text
     elif model.startswith('claude'):
         global claude_client
