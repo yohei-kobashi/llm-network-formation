@@ -2737,7 +2737,9 @@ def principle1_draw_graph(G, ax, G0=None, use_netgraph=True, nodecolor='#d35400'
     else:
         G0_edges = set(G0.edges())
     G_edges = set(G.edges()) - G0_edges
-    if not use_netgraph:
+    # netgraph's spring layout asserts a non-empty edge list, so fall back to a
+    # plain networkx node/edge drawing when the snapshot has no edges yet.
+    if not use_netgraph or G.number_of_edges() == 0:
         pos = nx.spring_layout(G)
 
         if not G0:
@@ -3128,6 +3130,9 @@ def principle1_run_network_formation_experiments_batch(experiment_records):
                 if not remaining:
                     break
 
+                attempt_cot_config = retry_cot_config(cot_config, attempt) if cot else cot_config
+                if cot and attempt_cot_config != cot_config:
+                    print(f'Retry attempt {attempt + 1}: max_new_tokens={attempt_cot_config.get("max_new_tokens")}, qwen_enable_thinking={attempt_cot_config.get("qwen_enable_thinking")}')
                 prompts = [request['prompt'] for _, request in remaining]
                 response_schemas = [request['response_schema'] for _, request in remaining]
                 answers = get_responses(
@@ -3136,7 +3141,7 @@ def principle1_run_network_formation_experiments_batch(experiment_records):
                     temperature=temperature,
                     response_schemas=response_schemas,
                     cot=cot,
-                    cot_config=cot_config,
+                    cot_config=attempt_cot_config,
                 )
 
                 next_remaining = []
@@ -4347,6 +4352,9 @@ def principle3_run_network_formation_experiments_batch(experiment_records):
                 if not remaining:
                     break
 
+                attempt_cot_config = retry_cot_config(cot_config, attempt) if cot else cot_config
+                if cot and attempt_cot_config != cot_config:
+                    print(f'Retry attempt {attempt + 1}: max_new_tokens={attempt_cot_config.get("max_new_tokens")}, qwen_enable_thinking={attempt_cot_config.get("qwen_enable_thinking")}')
                 prompts = [request['prompt'] for _, request in remaining]
                 response_schemas = [request['response_schema'] for _, request in remaining]
                 answers = get_responses(
@@ -4355,7 +4363,7 @@ def principle3_run_network_formation_experiments_batch(experiment_records):
                     temperature=temperature,
                     response_schemas=response_schemas,
                     cot=cot,
-                    cot_config=cot_config,
+                    cot_config=attempt_cot_config,
                 )
 
                 next_remaining = []
@@ -4387,6 +4395,9 @@ def principle3_run_network_formation_experiments_batch(experiment_records):
                 if not remaining:
                     break
 
+                attempt_cot_config = retry_cot_config(cot_config, attempt) if cot else cot_config
+                if cot and attempt_cot_config != cot_config:
+                    print(f'Retry attempt {attempt + 1}: max_new_tokens={attempt_cot_config.get("max_new_tokens")}, qwen_enable_thinking={attempt_cot_config.get("qwen_enable_thinking")}')
                 prompts = [request['prompt'] for _, _, request in remaining]
                 response_schemas = [request['response_schema'] for _, _, request in remaining]
                 answers = get_responses(
@@ -4395,7 +4406,7 @@ def principle3_run_network_formation_experiments_batch(experiment_records):
                     temperature=temperature,
                     response_schemas=response_schemas,
                     cot=cot,
-                    cot_config=cot_config,
+                    cot_config=attempt_cot_config,
                 )
 
                 next_remaining = []
@@ -5761,6 +5772,9 @@ def principle5_run_network_formation_experiments_batch(experiment_records):
                 if not remaining:
                     break
 
+                attempt_cot_config = retry_cot_config(cot_config, attempt) if cot else cot_config
+                if cot and attempt_cot_config != cot_config:
+                    print(f'Retry attempt {attempt + 1}: max_new_tokens={attempt_cot_config.get("max_new_tokens")}, qwen_enable_thinking={attempt_cot_config.get("qwen_enable_thinking")}')
                 prompts = [request['prompt'] for _, request in remaining]
                 response_schemas = [request['response_schema'] for _, request in remaining]
                 answers = get_responses(
@@ -5769,7 +5783,7 @@ def principle5_run_network_formation_experiments_batch(experiment_records):
                     temperature=temperature,
                     response_schemas=response_schemas,
                     cot=cot,
-                    cot_config=cot_config,
+                    cot_config=attempt_cot_config,
                 )
 
                 next_remaining = []
