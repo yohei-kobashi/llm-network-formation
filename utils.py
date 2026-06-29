@@ -75,7 +75,7 @@ SHARED_MODEL_NAMES = [
     'Qwen/Qwen3.5-0.8B',
 ]
 SHARED_DEFAULT_TEMPERATURES = [None]
-SHARED_DEFAULT_COT_CONFIG = {'max_new_tokens': 16384, 'qwen_enable_thinking': True}
+SHARED_DEFAULT_COT_CONFIG = {'max_new_tokens': 8192, 'qwen_enable_thinking': True}
 SHARED_COT_RETRY_MAX_NEW_TOKENS = 32768
 
 
@@ -1292,11 +1292,10 @@ def retry_cot_config(cot_config, attempt):
     config = dict(cot_config)
     if attempt <= 0:
         return config
-    base_tokens = int(config.get('max_new_tokens', 1000))
-    retry_max_new_tokens = int(globals().get('COT_RETRY_MAX_NEW_TOKENS', 32768))
-    config['max_new_tokens'] = max(base_tokens, retry_max_new_tokens)
-    if attempt >= 2:
-        config['qwen_enable_thinking'] = False
+    # On the first failure, immediately disable thinking instead of escalating
+    # max_new_tokens. Re-running with a larger token budget is slow; turning off
+    # thinking keeps the output short so the base budget stays sufficient.
+    config['qwen_enable_thinking'] = False
     return config
 
 
@@ -1307,7 +1306,7 @@ def principle2_select_neighbor(G, t, temperature, model, environment, role, num_
         try:
             attempt_cot_config = retry_cot_config(cot_config, i) if cot else cot_config
             if cot and attempt_cot_config and attempt_cot_config != cot_config:
-                print(f'Retrying with max_new_tokens={attempt_cot_config["max_new_tokens"]}')
+                print(f'Retrying with qwen_enable_thinking={attempt_cot_config.get("qwen_enable_thinking")}, max_new_tokens={attempt_cot_config.get("max_new_tokens")}')
             ans = get_response(request['prompt'], temperature=temperature, system_prompt="You are a helpful assistant", model=model, response_schema=request['response_schema'], cot=cot, cot_config=attempt_cot_config)
             result = principle2_parse_neighbor_response(ans, request)
             if i > 0:
@@ -6895,7 +6894,7 @@ def combined_select_neighbor(G, t, profiles, temperature=None, num_choices=1, nu
         try:
             attempt_cot_config = retry_cot_config(cot_config, attempt) if cot else cot_config
             if cot and attempt_cot_config and attempt_cot_config != cot_config:
-                print(f'Retrying with max_new_tokens={attempt_cot_config["max_new_tokens"]}')
+                print(f'Retrying with qwen_enable_thinking={attempt_cot_config.get("qwen_enable_thinking")}, max_new_tokens={attempt_cot_config.get("max_new_tokens")}')
             ans = get_response(request['prompt'], temperature=temperature, model=model, cot=cot, cot_config=attempt_cot_config)
             results = combined_parse_selection_response(ans)
 
