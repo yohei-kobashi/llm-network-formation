@@ -7,10 +7,12 @@ import random
 import os
 import copy
 import collections
+import itertools
 import gc
 import math
 import re
 import hashlib
+import ast
 import scipy
 import scipy.stats as stats
 import netgraph
@@ -19,7 +21,13 @@ import seaborn as sns
 import replicate
 import anthropic
 import torch
+import statsmodels.api as sm
+import dataloader
+import link_prediction
+import dcm
 from openai import OpenAI
+from sklearn.neighbors import NearestNeighbors
+from statsmodels.iolib.summary2 import summary_col
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
@@ -406,6 +414,130 @@ def summarize_generation_budget_calibration(
         'final_json_position_tokens': final_positions,
         'records': records,
     }
+    return summary
+
+
+def set_cot_retry_max_new_tokens(value):
+    """Update the module-wide CoT retry token budget used by retry_cot_config."""
+    global COT_RETRY_MAX_NEW_TOKENS
+    COT_RETRY_MAX_NEW_TOKENS = int(value)
+
+
+def run_cot_budget_calibration(
+    experiments,
+    output_dir,
+    default_temperatures,
+    default_cot_config,
+    build_calibration_requests,
+    parse_response,
+    calibration_filename,
+    apply_selected_budget=set_cot_retry_max_new_tokens,
+    run_experiments=True,
+    calibrate=True,
+    calibration_sample_size=20,
+    calibration_max_new_tokens=65536,
+    calibration_percentile=0.90,
+    calibration_margin=1.5,
+    retry_token_buckets=(8192, 16384, 32768, 65536),
+    calibration_seed=0,
+):
+    """Estimate the CoT retry token budget shared across the principle notebooks.
+
+    ``build_calibration_requests`` must return ``(record, request_items)`` where
+    ``request_items`` is a list of ``(label, request)`` tuples and each request has
+    ``prompt`` and ``response_schema`` keys. ``parse_response`` is the principle's
+    response parser, used to score how many sampled generations parse cleanly.
+    """
+    if not calibrate or not run_experiments:
+        print('CoT retry budget calibration skipped; using COT_RETRY_MAX_NEW_TOKENS =', COT_RETRY_MAX_NEW_TOKENS)
+        return None
+
+    output_dir = os.fspath(output_dir)
+    calibration_file = os.path.join(output_dir, calibration_filename)
+    cot_experiments = [
+        experiment for experiment in experiments
+        if experiment.get('run', True)
+        and experiment.get('COT', False)
+        and experiment['model'].startswith('Qwen/')
+    ]
+    if not cot_experiments:
+        print('No Qwen CoT experiments found; keeping COT_RETRY_MAX_NEW_TOKENS =', COT_RETRY_MAX_NEW_TOKENS)
+        return None
+
+    if os.path.exists(calibration_file) and not IGNORE_EXISTING_OUTPUTS:
+        with open(calibration_file) as f:
+            summary = json.load(f)
+        apply_selected_budget(int(summary['selected_max_new_tokens']))
+        print('Loaded CoT retry budget calibration:', COT_RETRY_MAX_NEW_TOKENS)
+        return summary
+
+    experiment = cot_experiments[0]
+    record, request_items = build_calibration_requests(
+        experiment,
+        output_dir,
+        default_temperatures,
+        sample_size=calibration_sample_size,
+        seed=calibration_seed,
+    )
+    prompts = [request['prompt'] for _, request in request_items]
+    response_schemas = [request['response_schema'] for _, request in request_items]
+    calibration_cot_config = dict(record.get('cot_config') or default_cot_config)
+    calibration_cot_config.update({
+        'max_new_tokens': calibration_max_new_tokens,
+        'qwen_enable_thinking': True,
+        'strip_qwen_thinking': False,
+    })
+
+    print(
+        f'Running {len(prompts)} CoT budget calibration generations for {record["model"]} '
+        f'with max_new_tokens={calibration_max_new_tokens}'
+    )
+    outputs = get_responses(
+        prompts,
+        record['model'],
+        temperature=record['temperatures'][0],
+        system_prompt='You are a helpful assistant',
+        response_schemas=response_schemas,
+        cot=True,
+        cot_config=calibration_cot_config,
+    )
+
+    parse_successes = []
+    for (_, request), output in zip(request_items, outputs):
+        try:
+            parse_response(output, request)
+            parse_successes.append(True)
+        except Exception:
+            parse_successes.append(False)
+
+    tokenizer = None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(record['model'], trust_remote_code=True)
+    except Exception as e:
+        print(f'Could not load tokenizer for calibration token counts; using character estimate: {e}')
+
+    summary = summarize_generation_budget_calibration(
+        outputs,
+        tokenizer=tokenizer,
+        parse_successes=parse_successes,
+        percentile=calibration_percentile,
+        margin=calibration_margin,
+        buckets=retry_token_buckets,
+        minimum_budget=min(retry_token_buckets),
+    )
+    summary.update({
+        'model': record['model'],
+        'experiment_name': record['name'],
+        'sample_size': len(outputs),
+        'calibration_max_new_tokens': calibration_max_new_tokens,
+        'sampled_nodes': [label for label, _ in request_items],
+    })
+
+    apply_selected_budget(int(summary['selected_max_new_tokens']))
+    with open(calibration_file, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print('Selected COT_RETRY_MAX_NEW_TOKENS =', COT_RETRY_MAX_NEW_TOKENS)
+    print('Calibration summary saved to', calibration_file)
     return summary
 
 
@@ -3644,6 +3776,77 @@ def principle1_build_experiment_record(experiment, output_dir, default_temperatu
     }
 
 
+def principle1_build_cot_calibration_requests(experiment, output_dir, default_temperatures, sample_size=20, seed=0):
+    record = principle1_build_experiment_record(experiment, output_dir, default_temperatures)
+    n = record['parameters']['n_max']
+    n0 = 1
+    temperature = record['temperatures'][0]
+    state = principle1_initialize_growth_state(n, n0, temperature, record)
+    rng = random.Random(seed)
+
+    collected = []
+    while state['t'] < state['end_t']:
+        request = principle1_build_neighbor_request(
+            state['candidates'],
+            state['candidate_idx'],
+            state['environment'],
+            state['role'],
+            True,
+            state['hash_and_shuffle'],
+            state['model'],
+        )
+        collected.append((state['t'], request))
+
+        # Advance the graph deterministically (without LLM calls) so later requests
+        # reflect realistic candidate-set sizes.
+        candidate_names = request['candidate_names']
+        result = None
+        if candidate_names:
+            chosen = rng.choice(candidate_names)
+            if request['hash_and_shuffle'] and request.get('hash2idx'):
+                mapped = request['hash2idx'][chosen]
+                chosen = int(mapped) if str(mapped).isdigit() else mapped
+            result = {'name': chosen, 'reason': 'calibration'}
+        principle1_advance_growth_state(state, result)
+
+    rng.shuffle(collected)
+    return record, collected[:sample_size]
+
+
+def principle1_run_cot_budget_calibration(
+    experiments,
+    output_dir,
+    default_temperatures,
+    default_cot_config,
+    run_experiments=True,
+    calibrate=True,
+    calibration_sample_size=20,
+    calibration_max_new_tokens=65536,
+    calibration_percentile=0.90,
+    calibration_margin=1.5,
+    retry_token_buckets=(8192, 16384, 32768, 65536),
+    calibration_seed=0,
+    calibration_filename='principle_1_cot_budget_calibration.json',
+):
+    return run_cot_budget_calibration(
+        experiments,
+        output_dir,
+        default_temperatures,
+        default_cot_config,
+        build_calibration_requests=principle1_build_cot_calibration_requests,
+        parse_response=principle1_parse_neighbor_response,
+        calibration_filename=calibration_filename,
+        run_experiments=run_experiments,
+        calibrate=calibrate,
+        calibration_sample_size=calibration_sample_size,
+        calibration_max_new_tokens=calibration_max_new_tokens,
+        calibration_percentile=calibration_percentile,
+        calibration_margin=calibration_margin,
+        retry_token_buckets=retry_token_buckets,
+        calibration_seed=calibration_seed,
+    )
+
+
 def principle1_run_configured_experiments(experiments, output_dir, default_temperatures, run_experiments=True, run_analysis=True):
     supported_models = set(filter_supported_models(sorted({experiment['model'] for experiment in experiments})))
     non_cot_outfiles = []
@@ -3719,3 +3922,3676 @@ def principle1_run_configured_experiments(experiments, output_dir, default_tempe
     }
 
 # --- End Principle 1 preferential-attachment utilities ---
+
+# --- Principle 3 profile-homophily utilities ---
+PRINCIPLE3_DEFAULT_PROFILES_FILENAME = 'profiles.jsonl'
+PRINCIPLE3_LUCKY_NUMBER_PROFILES_FILENAME = 'profiles_with_lucky_number.jsonl'
+
+
+def set_principle3_runtime_options(default_profiles_filename='profiles.jsonl', lucky_number_profiles_filename='profiles_with_lucky_number.jsonl', medium_size=26):
+    global PRINCIPLE3_DEFAULT_PROFILES_FILENAME, PRINCIPLE3_LUCKY_NUMBER_PROFILES_FILENAME
+    global MEDIUM_SIZE, SMALL_SIZE, BIGGER_SIZE
+    PRINCIPLE3_DEFAULT_PROFILES_FILENAME = default_profiles_filename
+    PRINCIPLE3_LUCKY_NUMBER_PROFILES_FILENAME = lucky_number_profiles_filename
+    MEDIUM_SIZE = medium_size
+    SMALL_SIZE = 0.85 * MEDIUM_SIZE
+    BIGGER_SIZE = 1.5 * MEDIUM_SIZE
+    plt.rc('font', size=SMALL_SIZE)
+    plt.rc('axes', titlesize=SMALL_SIZE)
+    plt.rc('axes', labelsize=MEDIUM_SIZE)
+    plt.rc('xtick', labelsize=0.7 * SMALL_SIZE)
+    plt.rc('ytick', labelsize=0.7 * SMALL_SIZE)
+    plt.rc('legend', fontsize=SMALL_SIZE)
+    plt.rc('figure', titlesize=BIGGER_SIZE)
+
+
+def principle3_generate_individuals(n):
+    profiles = []
+
+    hobbies = ['reading', 'writing', 'cooking']
+    colors = ['red', 'orange', 'yellow', 'green']
+
+    locations = ['New York City', 'Boston', 'Washington DC']
+
+    for i in range(n):
+        profile = {
+            'name' : i,
+            'hobby' : random.choice(hobbies),
+            'favorite color' : random.choice(colors),
+            'location' : random.choice(locations)
+        }
+
+        profiles.append(profile)
+
+    with open(PRINCIPLE3_DEFAULT_PROFILES_FILENAME, 'w+') as f:
+        [f.write(json.dumps(profile) + '\n') for profile in profiles]
+
+def principle3_network_growth(n0, temperature=None, model='gpt-5-mini', environment=None, role='friends', method='llm', cot=False, cot_config=None, profiles_filename=None, mutual_acceptance=False):
+    if profiles_filename is None:
+        profiles_filename = PRINCIPLE3_DEFAULT_PROFILES_FILENAME
+
+    with open(profiles_filename) as f:
+        profiles = f.read().splitlines()
+        profiles = [json.loads(profile) for profile in profiles]
+
+    profiles = profiles[:n0]
+
+    G = nx.Graph()
+    G.add_nodes_from(range(n0))
+
+    Gs = []
+    results = []
+    total_requests = 0
+    num_accepted_requests = 0
+
+    for t in range(n0):
+
+        if method == 'llm':
+            result = principle3_select_neighbor(G, t, profiles, temperature, model=model, environment=environment, role=role, cot=cot, cot_config=cot_config, mutual_acceptance=mutual_acceptance)
+
+            if result:
+                for r in result:
+                    v = r['name']
+                    if r.get('accepted', False):
+                        G.add_edge(t, v, similarity=r['similarity'])
+                        num_accepted_requests += 1
+                    total_requests += 1
+                results.append(result)
+        elif method in ['random', 'homophilous', 'heterophilous']:
+            if method == 'random':
+                new_nodes = random.sample(list(set(G.nodes()) - set([t])), 4)
+            elif method == 'homophilous':
+                new_nodes = list(sorted([v for v in G.nodes() if v != t], key=lambda v: len(set(principle3_profile_set(profiles[t])) & principle3_profile_set(profiles[v])), reverse=True))[:4]
+            elif method == 'heterophilous':
+                new_nodes = list(sorted([v for v in G.nodes() if v != t], key=lambda v: len(set(principle3_profile_set(profiles[t])) & principle3_profile_set(profiles[v]))))[:4]
+
+            for v in new_nodes:
+                intersection = list(set(principle3_profile_set(profiles[t])) & principle3_profile_set(profiles[v]))
+                union = list(set(principle3_profile_set(profiles[t])) | principle3_profile_set(profiles[v]))
+                similarity = len(intersection)
+                G.add_edge(t, v, intersection=intersection, union=union, similarity=similarity)
+                num_accepted_requests += 1
+                total_requests += 1
+
+            results.append([{'name' : v, 'intersection' : intersection, 'union' : union, 'similarity' : similarity} for v in new_nodes])
+
+        Gs.append(G.copy())
+
+    return Gs, results, num_accepted_requests / total_requests * 100
+
+def principle3_profile_set(p):
+    temp = []
+    for k, v in p.items():
+        if k == 'name':
+            continue
+        else:
+            temp.append(v)
+
+    return set(temp)
+
+def principle3_build_selection_request(G, t, profiles, environment, role, cot, model):
+    candidate_profiles = []
+    for v in G.nodes():
+        if v != t:
+            candidate_profiles.append(profiles[v])
+
+    if cot:
+        output_format = f"""
+    {{
+        "reason" : reason for selecting the person,
+        "name" : name of the person you selected
+    }}
+        """
+    else:
+        output_format = f"""
+    {{
+        "name" : name of the person you selected,
+        "reason" : reason for selecting the person
+    }}
+        """
+
+    candidate_names = [candidate['name'] for candidate in candidate_profiles]
+    response_schema = build_response_list_schema(candidate_names, max_items=4)
+    use_structured_output = not (model.startswith('Qwen/') and cot)
+    allowed_names_json = json.dumps(candidate_names, ensure_ascii=False)
+
+    prompt = f"""
+    # Task
+    {f'You are in a {environment}.' if environment else ''}Your task is to select a person to be {role} with.
+
+    # Profile
+    Your profile is given below after chevrons:
+    <PROFILE>
+    {json.dumps(profiles[t], separators=(',', ':'))}
+    </PROFILE>
+
+    # Candidate Profiles
+    The cadidate profiles to be friends with are given below after chevrons:
+
+    <PROFILES>
+    {json.dumps(candidate_profiles, separators=(',', ':'))}
+    </PROFILES>
+
+    # Output
+    The output should be given a list of JSON objects with the following structure
+
+    [
+        {output_format}, ...
+    ]
+
+    # Notes
+    * Return exactly one JSON array.
+    * The output must be a list of JSON objects ranked in the order of preference.
+    * You can make at most 4 selections.
+    * Do not explain your reasoning outside the JSON array.
+    * Do not write markdown fences.
+    * Do not write any text before or after the JSON array.
+    * Each value of "name" must be exactly one of these values: {allowed_names_json}
+    * Do not rename the person.
+    * Do not output labels such as "person 0", "Person 0", or "candidate 0".
+    """
+
+    return {
+        'prompt': prompt,
+        'response_schema': response_schema if use_structured_output else None,
+        'candidate_names': set(candidate_names),
+        't': t,
+        'profiles': profiles,
+    }
+
+def principle3_parse_selection_response(ans, request):
+    results = first_json_array(ans)
+    if not isinstance(results, list):
+        raise ValueError('Could not parse a valid JSON array.')
+
+    filtered_results = []
+    seen_names = set()
+    t = request['t']
+    profiles = request['profiles']
+    for result in results[:4]:
+        if not isinstance(result, dict) or 'name' not in result:
+            continue
+        normalized_name = normalize_name(result['name'], request['candidate_names'])
+        if normalized_name is None or normalized_name in seen_names:
+            continue
+        seen_names.add(normalized_name)
+        result['name'] = normalized_name
+        v = result['name']
+        result['intersection'] = list(principle3_profile_set(profiles[t]) & principle3_profile_set(profiles[v]))
+        result['union'] = list(principle3_profile_set(profiles[t]) | principle3_profile_set(profiles[v]))
+        result['similarity'] = len(result['intersection'])
+        filtered_results.append(result)
+
+    if not filtered_results:
+        raise ValueError('No valid candidate names in response.')
+    return filtered_results
+
+def principle3_build_acceptance_request(t, r, profiles, environment, role, cot, model):
+    acceptance_response_schema = build_acceptance_response_schema()
+    use_acceptance_structured_output = not (model.startswith('Qwen/') and cot)
+    prompt = f"""
+            # Task
+            {f'You are in a {environment}.' if environment else ''}. You receive a request to be {role} with a person.
+
+            # Profile
+            Your profile is given below after chevrons:
+            <PROFILE>
+            {json.dumps(profiles[t], separators=(',', ':'))}
+            </PROFILE>
+
+            # Candidate Profile
+            The candidate profile to be friends with is given below after chevrons:
+            <PROFILE>
+            {json.dumps(profiles[r['name']], separators=(',', ':'))}
+            </PROFILE>
+
+            # Output
+            The output should be a JSON object with the following structure
+
+            {{
+                "accept" : true/false,
+                "reason" : reason for accepting or rejecting the request
+            }}
+
+            # Notes
+            * Return exactly one JSON object.
+            * You can only accept or reject the request.
+            * Do not write markdown fences.
+            * Do not write any text before or after the JSON object.
+            """
+    return {
+        'prompt': prompt,
+        'response_schema': acceptance_response_schema if use_acceptance_structured_output else None,
+    }
+
+def principle3_parse_acceptance_response(ans):
+    results = first_json_object(ans)
+    if not isinstance(results, dict) or 'accept' not in results:
+        raise ValueError('Could not parse a valid JSON object with an accept field.')
+    return bool(results['accept']), results.get('reason', '')
+
+def principle3_select_neighbor(G, t, profiles, temperature, model, environment, role, cot, cot_config=None, mutual_acceptance=False):
+    request = principle3_build_selection_request(G, t, profiles, environment, role, cot, model)
+    filtered_results = []
+    for i in range(10):
+        try:
+            ans = get_response(request['prompt'], model, temperature, response_schema=request['response_schema'], cot=cot, cot_config=cot_config)
+            filtered_results = principle3_parse_selection_response(ans, request)
+            break
+        except Exception as e:
+            print(e)
+
+    for r in filtered_results:
+        if mutual_acceptance:
+            acceptance_request = principle3_build_acceptance_request(t, r, profiles, environment, role, cot, model)
+
+            for i in range(10):
+                try:
+                    ans = get_response(acceptance_request['prompt'], model, temperature, response_schema=acceptance_request['response_schema'], cot=cot, cot_config=cot_config)
+                    r['accepted'], r['acceptance_reason'] = principle3_parse_acceptance_response(ans)
+                    break
+                except Exception as e:
+                    print(e)
+            else:
+                r['accepted'] = False
+                r['acceptance_reason'] = 'Could not parse mutual acceptance response'
+        else:
+            r['accepted'] = True
+            r['acceptance_reason'] = 'Mutual acceptance is not enabled'
+
+    print(f'Node: {t}, Results: {filtered_results}')
+
+    return filtered_results
+
+def principle3_load_profiles(profiles_filename, n):
+    with open(profiles_filename) as f:
+        profiles = f.read().splitlines()
+        profiles = [json.loads(profile) for profile in profiles]
+    return profiles[:n]
+
+def principle3_initialize_growth_state(n, temperature, experiment_record):
+    profiles = principle3_load_profiles(experiment_record['profiles_filename'], n)
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+
+    return {
+        'n': n,
+        'temperature': temperature,
+        'temperature_label': 'default' if temperature is None else temperature,
+        'model': experiment_record['model'],
+        'environment': experiment_record['environment'],
+        'role': experiment_record['role'],
+        'cot': experiment_record['cot'],
+        'cot_config': experiment_record.get('cot_config'),
+        'profiles_filename': experiment_record['profiles_filename'],
+        'mutual_acceptance': experiment_record['mutual_acceptance'],
+        'outfile': experiment_record['outfile'],
+        'metadata': experiment_record['metadata'],
+        'G': G,
+        'profiles': profiles,
+        't': 0,
+        'graphs': [],
+        'reasons': [],
+        'total_requests': 0,
+        'num_accepted_requests': 0,
+    }
+
+def principle3_pending_growth_states_for_experiment(experiment_record):
+    parameters = experiment_record['parameters']
+    temperatures = experiment_record['temperatures']
+    outfile = experiment_record['outfile']
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    saved_scenarios = set()
+    if os.path.exists(outfile):
+        with open(outfile) as f:
+            lines = f.read().splitlines()
+        for line in lines:
+            scenario = json.loads(line)
+            saved_scenarios.add((scenario['n'], scenario['simulation'], scenario['temperature']))
+
+    print(f'Loaded {len(saved_scenarios)} completed simulations from {outfile}')
+    states = []
+    for n in range(parameters['n_min'], parameters['n_max'] + 1, parameters['n_step']):
+        for i in range(parameters['num_simulations']):
+            for temperature in temperatures:
+                temperature_label = 'default' if temperature is None else temperature
+                if (n, i, temperature_label) in saved_scenarios:
+                    print(f'Skipping simulation for n={n}, i={i}, temperature={temperature_label}')
+                    continue
+                print(f'Queueing simulation for n={n}, i={i}, temperature={temperature_label}, outfile={outfile}')
+                state = principle3_initialize_growth_state(n, temperature, experiment_record)
+                state['simulation'] = i
+                states.append(state)
+    return states
+
+def principle3_apply_selection_results(state, filtered_results):
+    t = state['t']
+    if filtered_results:
+        for r in filtered_results:
+            v = r['name']
+            if r.get('accepted', False):
+                state['G'].add_edge(t, v, similarity=r['similarity'])
+                state['num_accepted_requests'] += 1
+            state['total_requests'] += 1
+        state['reasons'].append(filtered_results)
+
+    state['graphs'].append(state['G'].copy())
+    state['t'] += 1
+
+def principle3_write_growth_state(state):
+    mutual_acceptance_probability = 0
+    if state['total_requests']:
+        mutual_acceptance_probability = state['num_accepted_requests'] / state['total_requests'] * 100
+
+    temp = {
+        'n' : state['n'],
+        'temperature' : state['temperature_label'],
+        'simulation' : state['simulation'],
+        'graphs' : [nx.to_dict_of_lists(G) for G in state['graphs']],
+        'reasons' : state['reasons'],
+        'mutual_acceptance_probability' : mutual_acceptance_probability,
+        'model' : state['model'],
+        'environment' : state['environment'] if state['environment'] is not None else 'Baseline',
+        'role' : state['role'],
+        'cot' : state['cot'],
+        'profiles_filename' : state['profiles_filename'],
+        'mutual_acceptance' : state['mutual_acceptance'],
+    }
+    if state['metadata']:
+        temp.update(state['metadata'])
+    with open(state['outfile'], 'a+') as f:
+        f.write(json.dumps(temp) + '\n')
+        f.flush()
+
+def principle3_add_default_acceptance(filtered_results):
+    for r in filtered_results:
+        r['accepted'] = True
+        r['acceptance_reason'] = 'Mutual acceptance is not enabled'
+
+def principle3_run_network_formation_experiments_batch(experiment_records):
+    if not experiment_records:
+        return
+
+    model = experiment_records[0]['model']
+    cot = experiment_records[0]['cot']
+    cot_config = experiment_records[0].get('cot_config')
+    active_states = []
+    for experiment_record in experiment_records:
+        active_states.extend(principle3_pending_growth_states_for_experiment(experiment_record))
+
+    if not active_states:
+        print(f'All batched simulations already completed for {model}. Skipping inference.')
+        return
+
+    print(f'Running {len(active_states)} batched simulations for {model}, cot={cot}')
+    while active_states:
+        requests_by_temperature = collections.defaultdict(list)
+        for state in active_states:
+            print(f'Selecting neighbors for node {state["t"]} in {state["metadata"]["experiment_name"]}, simulation={state["simulation"]}')
+            request = principle3_build_selection_request(
+                state['G'],
+                state['t'],
+                state['profiles'],
+                state['environment'],
+                state['role'],
+                state['cot'],
+                state['model'],
+            )
+            requests_by_temperature[state['temperature']].append((state, request))
+
+        selections_by_state_id = {}
+        for temperature, batch_items in requests_by_temperature.items():
+            remaining = list(batch_items)
+            for attempt in range(10):
+                if not remaining:
+                    break
+
+                prompts = [request['prompt'] for _, request in remaining]
+                response_schemas = [request['response_schema'] for _, request in remaining]
+                answers = get_responses(
+                    prompts,
+                    model,
+                    temperature=temperature,
+                    response_schemas=response_schemas,
+                    cot=cot,
+                    cot_config=cot_config,
+                )
+
+                next_remaining = []
+                for (state, request), ans in zip(remaining, answers):
+                    try:
+                        filtered_results = principle3_parse_selection_response(ans, request)
+                        selections_by_state_id[id(state)] = filtered_results
+                    except Exception as e:
+                        print(e)
+                        next_remaining.append((state, request))
+                remaining = next_remaining
+
+            for state, _ in remaining:
+                selections_by_state_id[id(state)] = []
+
+        acceptance_items_by_temperature = collections.defaultdict(list)
+        for state in active_states:
+            filtered_results = selections_by_state_id.get(id(state), [])
+            if state['mutual_acceptance']:
+                for r in filtered_results:
+                    request = principle3_build_acceptance_request(state['t'], r, state['profiles'], state['environment'], state['role'], state['cot'], state['model'])
+                    acceptance_items_by_temperature[state['temperature']].append((state, r, request))
+            else:
+                principle3_add_default_acceptance(filtered_results)
+
+        for temperature, batch_items in acceptance_items_by_temperature.items():
+            remaining = list(batch_items)
+            for attempt in range(10):
+                if not remaining:
+                    break
+
+                prompts = [request['prompt'] for _, _, request in remaining]
+                response_schemas = [request['response_schema'] for _, _, request in remaining]
+                answers = get_responses(
+                    prompts,
+                    model,
+                    temperature=temperature,
+                    response_schemas=response_schemas,
+                    cot=cot,
+                    cot_config=cot_config,
+                )
+
+                next_remaining = []
+                for (state, r, request), ans in zip(remaining, answers):
+                    try:
+                        r['accepted'], r['acceptance_reason'] = principle3_parse_acceptance_response(ans)
+                    except Exception as e:
+                        print(e)
+                        next_remaining.append((state, r, request))
+                remaining = next_remaining
+
+            for _, r, _ in remaining:
+                r['accepted'] = False
+                r['acceptance_reason'] = 'Could not parse mutual acceptance response'
+
+        next_active_states = []
+        for state in active_states:
+            filtered_results = selections_by_state_id.get(id(state), [])
+            print(f'Node: {state["t"]}, Results: {filtered_results}')
+            principle3_apply_selection_results(state, filtered_results)
+            if state['t'] >= state['n']:
+                principle3_write_growth_state(state)
+            else:
+                next_active_states.append(state)
+        active_states = next_active_states
+
+def principle3_run_network_formation_experiment(n_min, n_max, n_step, num_simulations, outfile, temperatures=None, method='llm', model='gpt-5-mini', environment=None, role='friends', cot=False, cot_config=None, profiles_filename=None, mutual_acceptance=False, metadata=None):
+    if profiles_filename is None:
+        profiles_filename = PRINCIPLE3_DEFAULT_PROFILES_FILENAME
+
+    if temperatures is None:
+        temperatures = [None]
+
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    saved_scenarios = set()
+
+    if os.path.exists(outfile):
+        with open(outfile) as f:
+            lines = f.read().splitlines()
+
+        for line in lines:
+            scenario = json.loads(line)
+            saved_scenarios.add((scenario['n'], scenario['simulation'], scenario['temperature']))
+
+    expected_scenarios = {
+        (n, i, 'default' if temperature is None else temperature)
+        for n in range(n_min, n_max + 1, n_step)
+        for i in range(num_simulations)
+        for temperature in temperatures
+    }
+
+    if expected_scenarios.issubset(saved_scenarios):
+        print(f'All simulations already completed for {outfile}. Skipping inference.')
+        return
+
+    print(f'Loaded {len(saved_scenarios)} completed simulations from {outfile}')
+
+    f = open(outfile, 'a+')
+
+    for n in range(n_min, n_max + 1, n_step):
+        for i in range(num_simulations):
+            for temperature in temperatures:
+                temperature_label = 'default' if temperature is None else temperature
+                if (n, i, temperature_label) in saved_scenarios:
+                    print(f'Skipping simulation for n={n}, i={i}, temperature={temperature_label}')
+                    continue
+                else:
+                    print(f'Running simulation for n={n}, i={i}, temperature={temperature_label}')
+
+                    Gs, reasons, mutual_acceptance_probability = principle3_network_growth(n, temperature=temperature, method=method, model=model, environment=environment, role=role, cot=cot, cot_config=cot_config, profiles_filename=profiles_filename, mutual_acceptance=mutual_acceptance)
+
+                    temp = {
+                        'n' : n,
+                        'temperature' : temperature_label,
+                        'simulation' : i,
+                        'graphs' : [nx.to_dict_of_lists(G) for G in Gs],
+                        'reasons' : reasons,
+                        'mutual_acceptance_probability' : mutual_acceptance_probability,
+                        'model' : model,
+                        'environment' : environment if environment is not None else 'Baseline',
+                        'role' : role,
+                        'cot' : cot,
+                        'profiles_filename' : profiles_filename,
+                        'mutual_acceptance' : mutual_acceptance,
+                    }
+                    if metadata:
+                        temp.update(metadata)
+
+                    f.write(json.dumps(temp) + '\n')
+                    f.flush()
+
+                if method != 'llm':
+                    break
+
+    f.close()
+
+def principle3_draw_graph(G, ax, communities=None, palette=None, use_netgraph=True, ego_network=False):
+
+    if not use_netgraph:
+        pos = nx.spring_layout(G, weight='similarity')
+
+        if communities:
+            for i, community in enumerate(communities):
+                nx.draw_networkx_nodes(G, pos, nodelist=list(community), node_size=20, node_color=palette[i], ax=ax)
+        else:
+            nx.draw_networkx_nodes(G, pos, nodelist=list(G.nodes()), node_size=20, node_color='#d35400', ax=ax)
+
+        edge_widths = [1 + G.edges[u, v]['similarity'] for (u, v) in G.edges()]
+
+        nx.draw_networkx_edges(G, pos, edgelist=list(G.edges()), width=edge_widths, edge_color='#34495e', alpha=0.5, ax=ax)
+    elif use_netgraph and not ego_network:
+        node2community = {node: i for i, community in enumerate(communities) for node in community}
+        node_color = {node : palette[node2community[node]] for node in G.nodes()}
+        edge_widths = {(u, v) : (1 + G.edges[u, v]['similarity']) * 0.5 for (u, v) in G.edges()}
+
+        # netgraph.Graph(G, node_layout='community', node_color=node_color, node_layout_kwargs=dict(node_to_community=node2community), node_size=2.5, edge_width=edge_widths, edge_color='#34495e', edge_layout='bundled', edge_layout_kwargs=dict(k=2000), ax=ax)
+        netgraph.Graph(G, node_layout='community', node_color=node_color, node_layout_kwargs=dict(node_to_community=node2community), node_size=2.5, edge_width=edge_widths, edge_color='#34495e', ax=ax)
+
+    elif use_netgraph and ego_network:
+        ego_net = nx.ego_graph(G, list(G.nodes())[0], radius=1)
+
+        node2community = {node: i for i, community in enumerate(communities) for node in community}
+
+        node_color = {node : palette[node2community[node]] for node in ego_net.nodes()}
+        node_size = {}
+
+        for node in ego_net.nodes():
+            if node == list(G.nodes())[0]:
+                node_size[node] = 5
+            else:
+                node_size[node] = 2.5
+
+        edge_widths = {(u, v) : (1 + ego_net.edges[u, v]['similarity']) * 0.5 for (u, v) in ego_net.edges()}
+        netgraph.Graph(ego_net, node_layout='community', node_color=node_color, node_layout_kwargs=dict(node_to_community=node2community), node_size=node_size, edge_width=edge_widths, edge_color='#34495e', ax=ax)
+
+    ax.set_axis_off()
+
+def principle3_analyze_experiments(filename):
+    os.makedirs('figures/principle_3', exist_ok=True)
+
+    palette = ['#d35400', '#34495e', '#2980b9', '#e67e22', '#f1c40f', '#7f8c8d', '#27ae60', '#16a085', '#bdc3c7', '#1abc9c', '#2ecc71', '#3498db', '#9b59b6', '#8e44ad', '#ecf0f1']
+
+    with open(filename) as f:
+        lines = f.read().splitlines()
+
+    data = []
+
+
+    for line in lines:
+        data.append(json.loads(line))
+
+    edge_similarity_distributions = { 'homophilous' : collections.defaultdict(list), 'random' : collections.defaultdict(list), 'heterophilous' : collections.defaultdict(list), 'llm' : collections.defaultdict(list) }
+    wasserstein_distance = { 'homophilous' : collections.defaultdict(list), 'random' : collections.defaultdict(list), 'heterophilous' : collections.defaultdict(list) }
+    louvain_communities = { 'homophilous' : collections.defaultdict(list), 'random' : collections.defaultdict(list), 'heterophilous' : collections.defaultdict(list), 'llm' : collections.defaultdict(list) }
+    louvain_modularity = { 'homophilous' : collections.defaultdict(list), 'random' : collections.defaultdict(list), 'heterophilous' : collections.defaultdict(list), 'llm' : collections.defaultdict(list) }
+    location_assortativities = { 'homophilous' : collections.defaultdict(list), 'random' : collections.defaultdict(list), 'heterophilous' : collections.defaultdict(list), 'llm' : collections.defaultdict(list)}
+    favorite_color_assortativities = { 'homophilous' : collections.defaultdict(list), 'random' : collections.defaultdict(list), 'heterophilous' : collections.defaultdict(list), 'llm' : collections.defaultdict(list)}
+    hobby_assortativities = { 'homophilous' : collections.defaultdict(list), 'random' : collections.defaultdict(list), 'heterophilous' : collections.defaultdict(list), 'llm' : collections.defaultdict(list)}
+
+    final_graphs = collections.defaultdict(list)
+
+    with open(PRINCIPLE3_DEFAULT_PROFILES_FILENAME) as f:
+        profiles = f.read().splitlines()
+        profiles = [json.loads(profile) for profile in profiles]
+
+    profiles_dict = {str(profile['name']) : profile for profile in profiles}
+
+    for d in data:
+        Gs = []
+        for graph in d['graphs']:
+            G = nx.from_dict_of_dicts(graph)
+
+            nx.set_node_attributes(G, profiles_dict)
+
+            G.remove_edges_from(nx.selfloop_edges(G))
+            # G.remove_nodes_from(list(nx.isolates(G)))
+
+            Gs.append(G)
+
+        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+
+        louvain_communities['llm'][d['n'], d['temperature']].append(nx.algorithms.community.louvain_communities(Gs[-1], weight='similarity'))
+        louvain_modularity['llm'][d['n'], d['temperature']].append(nx.algorithms.community.modularity(Gs[-1], louvain_communities['llm'][d['n'], d['temperature']][-1], weight='similarity'))
+
+
+        final_graphs[d['n'], d['temperature']].append((Gs[-1], louvain_communities['llm'][d['n'], d['temperature']][-1]))
+
+
+        G_homophilous = principle3_network_growth(d['n'], d['temperature'], method='homophilous')[0][-1]
+        G_heterophilous = principle3_network_growth(d['n'], d['temperature'], method='heterophilous')[0][-1]
+        G_random = principle3_network_growth(d['n'], d['temperature'], method='random')[0][-1]
+
+        nx.set_node_attributes(G_homophilous, {int(profile['name']) : profile for profile in profiles})
+        nx.set_node_attributes(G_heterophilous, {int(profile['name']) : profile for profile in profiles})
+        nx.set_node_attributes(G_random, {int(profile['name']) : profile for profile in profiles})
+
+        ax[0].set_title(f'Temperature = {d["temperature"]}')
+
+        principle3_draw_graph(Gs[-1], ax=ax[0], communities=louvain_communities['llm'][d['n'], d['temperature']][-1], palette=palette)
+
+        edge_similarity_distribution = [G.edges[u, v]['similarity'] for (u, v) in Gs[-1].edges()]
+        edge_similarity_distribution_homophilous = [G_homophilous.edges[u, v]['similarity'] for (u, v) in G_homophilous.edges()]
+        edge_similarity_distribution_heterophilous = [G_heterophilous.edges[u, v]['similarity'] for (u, v) in G_heterophilous.edges()]
+        edge_similarity_distribution_random = [G_random.edges[u, v]['similarity'] for (u, v) in G_random.edges()]
+
+        wasserstein_distance['homophilous'][d['n'], d['temperature']].append(stats.wasserstein_distance(edge_similarity_distribution, edge_similarity_distribution_homophilous))
+        wasserstein_distance['heterophilous'][d['n'], d['temperature']].append(stats.wasserstein_distance(edge_similarity_distribution, edge_similarity_distribution_heterophilous))
+        wasserstein_distance['random'][d['n'], d['temperature']].append(stats.wasserstein_distance(edge_similarity_distribution, edge_similarity_distribution_random))
+
+        print(f'Temperature: {d["temperature"]} T-test Test Homophilous: {stats.ttest_ind(edge_similarity_distribution, edge_similarity_distribution_homophilous, equal_var=False, alternative="less")}')
+        print(f'Temperature: {d["temperature"]} T-test Test Random: {stats.ttest_ind(edge_similarity_distribution, edge_similarity_distribution_random, equal_var=False, alternative="two-sided")}')
+
+
+        edge_similarity_distributions['homophilous'][d['n'], d['temperature']].extend(edge_similarity_distribution_homophilous)
+        edge_similarity_distributions['heterophilous'][d['n'], d['temperature']].extend(edge_similarity_distribution_heterophilous)
+        edge_similarity_distributions['random'][d['n'], d['temperature']].extend(edge_similarity_distribution_random)
+        edge_similarity_distributions['llm'][d['n'], d['temperature']].extend(edge_similarity_distribution)
+
+        louvain_communities['homophilous'][d['n'], d['temperature']].append(nx.algorithms.community.louvain_communities(G_homophilous, weight='similarity'))
+        louvain_communities['random'][d['n'], d['temperature']].append(nx.algorithms.community.louvain_communities(G_random, weight='similarity'))
+
+        louvain_modularity['homophilous'][d['n'], d['temperature']].append(nx.algorithms.community.modularity(G_homophilous, louvain_communities['homophilous'][d['n'], d['temperature']][-1], weight='similarity'))
+        louvain_modularity['random'][d['n'], d['temperature']].append(nx.algorithms.community.modularity(G_random, louvain_communities['random'][d['n'], d['temperature']][-1], weight='similarity'))
+
+        location_assortativities['homophilous'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_homophilous, 'location'))
+        location_assortativities['heterophilous'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_heterophilous, 'location'))
+        location_assortativities['random'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_random, 'location'))
+        location_assortativities['llm'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(Gs[-1], 'location'))
+
+        favorite_color_assortativities['homophilous'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_homophilous, 'favorite color'))
+        favorite_color_assortativities['heterophilous'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_heterophilous, 'favorite color'))
+        favorite_color_assortativities['random'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_random, 'favorite color'))
+        favorite_color_assortativities['llm'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(Gs[-1], 'favorite color'))
+
+        hobby_assortativities['homophilous'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_homophilous, 'hobby'))
+        hobby_assortativities['heterophilous'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_heterophilous, 'hobby'))
+        hobby_assortativities['random'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(G_random, 'hobby'))
+        hobby_assortativities['llm'][d['n'], d['temperature']].append(nx.attribute_assortativity_coefficient(Gs[-1], 'hobby'))
+
+
+        sns.histplot(edge_similarity_distribution, ax=ax[1], label='LLM', color='#d35400', binwidth=0.45, discrete=True, stat='density')
+        ax[1].xaxis.set_major_locator(mticker.MultipleLocator(1))
+
+        ax[1].set_xlabel('Number of Common Attributes')
+        ax[1].set_ylabel('Probability of Edge Creation')
+        ax[1].set_ylim(0, 0.75)
+        ax[1].legend()
+
+        fig.tight_layout()
+        fig.savefig(f'figures/principle_3/principle_3_profiles_{d["n"]}_{d["simulation"]}_{d["temperature"]}.png', dpi=300)
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+
+    ax[0].set_xlabel('Temperature')
+    ax[0].set_ylabel('Wasserstein Distance')
+
+
+    wasserstein_distance_means = { 'homophilous' : [], 'heterophilous' : [], 'random' : [] }
+    wasserstein_distance_stds = { 'homophilous' : [],  'heterophilous' : [], 'random' : [] }
+
+    for method, color in zip(['homophilous', 'heterophilous', 'random'], palette[:3]):
+        for i, k in enumerate(sorted(wasserstein_distance[method].keys())):
+            v = np.array(wasserstein_distance[method][k])
+            mean = v.mean()
+            std = v.std()
+
+            wasserstein_distance_means[method].append(mean)
+            wasserstein_distance_stds[method].append(std)
+
+    for method, color in zip(['homophilous', 'random'], palette[:3]):
+
+        ax[0].plot(np.arange(len(wasserstein_distance[method])), wasserstein_distance_means[method], label=method.capitalize(), marker='o', color=color)
+        ax[0].fill_between(np.arange(len(wasserstein_distance[method])), np.array(wasserstein_distance_means[method]) - 1.96 * np.array(wasserstein_distance_stds[method]) / np.sqrt(len(wasserstein_distance[method])), np.array(wasserstein_distance_means[method]) + 1.96 * np.array(wasserstein_distance_stds[method]) / np.sqrt(len(wasserstein_distance[method])), alpha=0.2, color=color)
+
+    ax[0].set_xticks(np.arange(len(wasserstein_distance['homophilous'])))
+    ax[0].set_xticklabels([f'{k[1]}' for k in sorted(wasserstein_distance['homophilous'].keys())])
+    ax[0].legend()
+    ax[0].set_ylabel(f'Wasserstein Distance')
+
+
+    objs = []
+
+    for i, k in enumerate(sorted(edge_similarity_distributions['llm'].keys())):
+        objs.append(pd.DataFrame.from_dict({'Number of Common Attributes' : edge_similarity_distributions['llm'][k], 'Method' : f'{k[1]}'}))
+
+        if i == len(edge_similarity_distributions['llm'].keys()) - 1:
+            for method in ['homophilous', 'random']:
+                objs.append(pd.DataFrame.from_dict({'Number of Common Attributes' : edge_similarity_distributions[method][k], 'Method' : method.capitalize()}))
+
+
+    df = pd.concat(axis=0, ignore_index=True, objs=objs)
+
+    sns.histplot(
+        data=df, x='Number of Common Attributes', hue='Method', multiple='dodge', palette=palette,
+        bins=range(4), ax=ax[1], discrete=True, shrink=0.8, stat='probability', common_norm=False
+    )
+
+    sns.move_legend(ax[1], bbox_to_anchor=(1, 0.5), loc='center left', frameon=False)
+
+    ax[1].set_ylabel('Probability of Edge Creation')
+
+    fig.tight_layout()
+
+    fig.savefig('figures/principle_3/principle_3_profiles_overall.pdf')
+
+    fig, ax = plt.subplots(1, len(final_graphs), figsize=(5 * (len(final_graphs)), 5))
+
+    for i, (k, v) in enumerate(sorted(final_graphs.items())):
+        G = v[0][0]
+        communities = v[0][1]
+        ax[i].set_title(f"Temperature = {k[-1]}", fontsize=MEDIUM_SIZE)
+        principle3_draw_graph(G, ax=ax[i], communities=communities, palette=palette)
+
+
+    # sns.histplot(
+    #     data=df, x='Number of Common Attributes', hue='Method', multiple='dodge',
+    #     bins=range(4), ax=ax[-1], discrete=True, shrink=0.8, stat='probability', common_norm=False, palette=palette
+    # )
+
+    # sns.barplot(
+    #     data=df, y='Number of Common Attributes', x='Method', ax=ax[-1], palette=palette
+    # )
+
+    # plt.xticks(fontsize=SMALL_SIZE, rotation=90)
+
+
+    # sns.move_legend(ax[-1], bbox_to_anchor=(1, 0.5), loc='center left', frameon=False)
+
+    # ax[-1].set_ylabel('# Common Attributes')
+
+    fig.tight_layout()
+
+    fig.savefig('figures/principle_3/principle_3_profiles_final_graphs.pdf', bbox_inches='tight')
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+    ax[0].set_ylabel('Louvain Modularity')
+    ax[1].set_ylabel('Num. of Communities')
+    ax[2].set_ylabel('Community Size')
+
+    ax[0].spines[['right', 'top']].set_visible(False)
+    ax[1].spines[['right', 'top']].set_visible(False)
+    ax[2].spines[['right', 'top']].set_visible(False)
+
+    j = 0
+
+    for method in ['llm']:
+        for i, k in enumerate(sorted(louvain_modularity[method].keys())):
+            if method != 'llm' and i != 0:
+                continue
+
+            modularities = np.array(louvain_modularity[method][k])
+            number_of_communities = np.array([len(c) for c in louvain_communities[method][k]])
+            community_sizes = np.array([len(v) for c in louvain_communities[method][k] for v in c])
+
+
+            if method == 'llm':
+                label = f'{k[-1]}'
+            else:
+                label = method.capitalize()
+
+            mean_modularity = modularities.mean()
+            ci_modularity = 1.96 * modularities.std() / np.sqrt(len(modularities))
+
+            mean_number_of_communities = number_of_communities.mean()
+            ci_number_of_communities = 1.96 * number_of_communities.std() / np.sqrt(len(number_of_communities))
+
+            mean_community_sizes = community_sizes.mean()
+            ci_community_sizes = 1.96 * community_sizes.std() / np.sqrt(len(community_sizes))
+
+            # ax[0].bar(i, mean_modularity, yerr=ci_modularity, label=label, color=palette[j])
+            # ax[1].bar(i, mean_number_of_communities, yerr=ci_number_of_communities, label=label, color=palette[j])
+            # ax[2].bar(i, mean_community_sizes, yerr=ci_community_sizes, label=label, color=palette[j])
+
+
+            ax[0].errorbar(k[-1], mean_modularity, yerr=ci_modularity, fmt='o', label=label, color=palette[j], capsize=5)
+            ax[1].errorbar(k[-1], mean_number_of_communities, yerr=ci_number_of_communities, fmt='o', label=label, color=palette[j], capsize=5)
+            ax[2].errorbar(k[-1], mean_community_sizes, yerr=ci_community_sizes, fmt='o', label=label, color=palette[j], capsize=5)
+
+
+
+
+            # sns.distplot(modularities, hist=False, ax=ax[0], label=label, color=palette[j])
+            # sns.distplot(number_of_communities, hist=False, ax=ax[1], label=label, color=palette[j])
+            # sns.distplot(community_sizes, hist=False, ax=ax[2], label=label, color=palette[j])
+
+
+
+            j += 1
+
+            for r, k_prime in enumerate(sorted(louvain_modularity[method].keys())):
+                if k_prime[-1] < k[-1]:
+
+                    modularities_prime = np.array(louvain_modularity[method][k_prime])
+                    number_of_communities_prime = np.array([len(c) for c in louvain_communities[method][k_prime]])
+                    community_sizes_prime = np.array([len(v) for c in louvain_communities[method][k_prime] for v in c])
+
+                    print(f'T-test Temperatures: {k[-1]}, {k_prime[-1]} Modularity: {stats.ttest_ind(modularities, modularities_prime, equal_var=False, alternative="greater")}')
+                    print(f'T-test Temperatures: {k[-1]}, {k_prime[-1]} Number of Communities: {stats.ttest_ind(number_of_communities, number_of_communities_prime, equal_var=False, alternative="greater")}')
+                    print(f'T-test Temperatures: {k[-1]}, {k_prime[-1]} Community Sizes: {stats.ttest_ind(community_sizes, community_sizes_prime, equal_var=False, alternative="less")}')
+
+
+    # ax[0].legend(loc='upper right')
+
+    # fig.supxlabel('Temperature', fontsize=MEDIUM_SIZE)
+
+    fig.tight_layout()
+
+    fig.savefig('figures/principle_3/principle_3_profiles_louvain_modularity.pdf', bbox_inches='tight')
+
+    assortativities_records = []
+
+    for method in ['llm', 'random']:
+        for i, k in enumerate(sorted(location_assortativities[method].keys())):
+            if method == 'llm':
+                label = f'{k[-1]}'
+            else:
+                label = method.capitalize()[:4]
+
+            for v in location_assortativities[method][k]:
+                assortativities_records.append({
+                    'Method' : label,
+                    'Location' : v,
+                })
+
+            for v in favorite_color_assortativities[method][k]:
+                assortativities_records.append({
+                    'Method' : label,
+                    'Color' : v,
+                })
+
+            for v in hobby_assortativities[method][k]:
+                assortativities_records.append({
+                    'Method' : label,
+                    'Hobby' : v,
+                })
+
+
+    df = pd.DataFrame.from_records(assortativities_records)
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
+
+
+    fig.suptitle('Attribute Assortativities', fontsize=MEDIUM_SIZE)
+
+    num_tests = 3
+
+    alpha = 0.1
+    errorbar_ci = 100 - alpha / num_tests
+
+    sns.barplot(data=df, x='Method', y='Location', ax=ax[0], palette=palette, errorbar=('ci', errorbar_ci))
+    sns.barplot(data=df, x='Method', y='Color', ax=ax[1], palette=palette, errorbar=('ci', errorbar_ci))
+    sns.barplot(data=df, x='Method', y='Hobby', ax=ax[2], palette=palette, errorbar=('ci', errorbar_ci))
+
+
+
+
+    for i in range(3):
+        for tick in ax[i].get_xticklabels():
+            tick.set_fontsize(SMALL_SIZE)
+
+
+        ax[i].set_xlabel('')
+        ax[i].spines[['right', 'top']].set_visible(False)
+
+
+    fig.tight_layout()
+
+    fig.savefig('figures/principle_3/principle_3_assortativities.pdf', bbox_inches='tight')
+
+def principle3_get_table(filenames, sfx='', attributes=['Location', 'Favorite Color', 'Hobby'], environments=True, profiles_filename=None, mutual_acceptance=False, communities=True):
+    if profiles_filename is None:
+        profiles_filename = PRINCIPLE3_DEFAULT_PROFILES_FILENAME
+
+    os.makedirs('figures', exist_ok=True)
+    os.makedirs('tables', exist_ok=True)
+
+    records_assortativities = []
+    records_communities = []
+
+    num_tests = len(attributes)
+
+    for filename in filenames:
+        suffix = os.path.split(os.path.splitext(filename)[0])[-1]
+        suffix = suffix.split('+')
+
+        if len(suffix) == 3:
+            model = suffix[-2]
+            environment = suffix[-1]
+        elif len(suffix) == 2:
+            model = suffix[-1]
+            environment = 'Baseline'
+        else:
+            model = suffix[-1]
+            environment = 'Baseline'
+
+        with open(filename) as f:
+            lines = f.read().splitlines()
+
+        data = []
+
+
+        for line in lines:
+            data.append(json.loads(line))
+
+        with open(profiles_filename) as f:
+            profiles = f.read().splitlines()
+            profiles = [json.loads(profile) for profile in profiles]
+
+        profiles_dict = {str(profile['name']) : profile for profile in profiles}
+
+        for d in data:
+            if 'model' in d:
+                model = str(d['model']).replace('/', '-')
+                if d.get('cot') and not model.endswith('_cot'):
+                    model = f'{model}_cot'
+                environment = d.get('environment', 'Baseline')
+                if environment is None:
+                    environment = 'Baseline'
+                if d.get('cot') and environment != 'Baseline' and not str(environment).endswith('_cot'):
+                    environment = f'{environment}_cot'
+
+            Gs = []
+            for graph in d['graphs']:
+                G = nx.from_dict_of_dicts(graph)
+
+                nx.set_node_attributes(G, profiles_dict)
+
+                G.remove_edges_from(nx.selfloop_edges(G))
+                G.remove_nodes_from(list(nx.isolates(G)))
+
+                Gs.append(G)
+
+            # import pdb; pdb.set_trace()
+
+            louvain_communities = nx.algorithms.community.louvain_communities(Gs[-1], weight='similarity')
+
+            louvain_modularity = nx.algorithms.community.modularity(Gs[-1], louvain_communities, weight='similarity')
+            louvain_num_communities = len(louvain_communities)
+            louvain_community_average_size = np.mean([len(c) for c in louvain_communities])
+
+            location_assortativity = nx.attribute_assortativity_coefficient(Gs[-1], 'location')
+            favorite_color_assortativity = nx.attribute_assortativity_coefficient(Gs[-1], 'favorite color')
+            hobby_assortativity = nx.attribute_assortativity_coefficient(Gs[-1], 'hobby')
+            lucky_number_assortativity = nx.attribute_assortativity_coefficient(Gs[-1], 'lucky number')
+
+            mutual_acceptance_probability = d.get('mutual_acceptance_probability', 100)
+
+            G_random = principle3_network_growth(d['n'], d['temperature'], method='random', model='', environment='', role='')[0][-1]
+
+            nx.set_node_attributes(G_random, {int(profile['name']) : profile for profile in profiles})
+
+            location_assortativity_random = nx.attribute_assortativity_coefficient(G_random, 'location')
+            favorite_color_assortativity_random = nx.attribute_assortativity_coefficient(G_random, 'favorite color')
+            hobby_assortativity_random = nx.attribute_assortativity_coefficient(G_random, 'hobby')
+            lucky_number_assortativity_random = nx.attribute_assortativity_coefficient(G_random, 'lucky number')
+
+
+
+            record = {
+                'Temperature' : d['temperature'],
+                'Model' : model,
+                'Environment' : environment,
+                'Location' : location_assortativity,
+                'Favorite Color' : favorite_color_assortativity,
+                'Hobby' : hobby_assortativity,
+                'Lucky Number' : lucky_number_assortativity,
+                'Modularity' : louvain_modularity,
+                'Mutual Acceptance Probability' : mutual_acceptance_probability,
+            }
+
+            record_random = {
+                'Temperature' : d['temperature'],
+                'Model' : 'Random',
+                'Environment' : 'Baseline',
+                'Location' : location_assortativity_random,
+                'Favorite Color' : favorite_color_assortativity_random,
+                'Lucky Number' : lucky_number_assortativity_random,
+                'Hobby' : hobby_assortativity_random,
+                'Mutual Acceptance Probability' : 100,
+            }
+
+            records_assortativities.append(record)
+            records_assortativities.append(record_random)
+
+            record_communities = {
+                'Temperature' : d['temperature'],
+                'Model' : model,
+                'Environment' : environment,
+                'Modularity' : louvain_modularity,
+                'Number of Communities' : louvain_num_communities,
+                'Average Community Size' : louvain_community_average_size
+            }
+
+            records_communities.append(record_communities)
+
+
+    df = pd.DataFrame(records_assortativities)
+
+    # average over simulations
+    df_groupped = df.groupby(['Model', 'Environment', 'Temperature']).mean().reset_index()
+
+    # do t-test with random
+    for temperature in df['Temperature'].unique():
+        for metric in attributes:
+            for model in df['Model'].unique():
+                if model == 'Random':
+                    continue
+                data = df[(df['Temperature'] == temperature) & (df['Model'] == model)][metric].values
+                data_random = df[(df['Temperature'] == temperature) & (df['Model'] == 'Random')][metric].values
+
+                t, p = stats.ttest_ind(data, data_random, equal_var=False)
+
+                # Get stars
+                if p < 0.001:
+                    p = '***'
+                elif p < 0.01:
+                    p = '**'
+                elif p < 0.05:
+                    p = '*'
+                else:
+                    p = ''
+
+                if p != '':
+                    df_groupped.loc[(df_groupped['Temperature'] == temperature) & (df_groupped['Model'] == model), metric] = f'{df_groupped.loc[(df_groupped["Temperature"] == temperature) & (df_groupped["Model"] == model), metric].values[0]:.3f} ({p})'
+
+    df_groupped = df_groupped[df_groupped['Model'] != 'Random']
+
+    df_groupped.sort_values(['Model', 'Environment', 'Temperature'], inplace=True)
+
+    df_groupped.to_csv(f'tables/principle_3_assortativities{sfx}.csv', index=False)
+    df_groupped.to_latex(f'tables/principle_3_assortativities{sfx}.tex', index=False, escape=False, float_format="%.2f")
+
+    df_communities = pd.DataFrame(records_communities)
+
+    df_communities_groupped = df_communities.groupby(['Model', 'Environment', 'Temperature']).mean().reset_index()
+
+    # do t-test of Louvain modularity with 0
+    for temperature in df_communities['Temperature'].unique():
+        for model in df_communities['Model'].unique():
+            if model == 'Random':
+                continue
+            data = df_communities[(df_communities['Temperature'] == temperature) & (df_communities['Model'] == model)]['Modularity'].values
+
+            t, p = stats.ttest_1samp(data, 0, alternative='greater')
+
+            # Get stars
+            if p < 0.001:
+                p = '***'
+            elif p < 0.01:
+                p = '**'
+            elif p < 0.05:
+                p = '*'
+            else:
+                p = ''
+
+            if p != '':
+                df_communities_groupped.loc[(df_communities_groupped['Temperature'] == temperature) & (df_communities_groupped['Model'] == model), 'Modularity'] = f'{df_communities_groupped.loc[(df_communities_groupped["Temperature"] == temperature) & (df_communities_groupped["Model"] == model), "Modularity"].values[0]:.3f} ({p})'
+
+    df_communities_groupped = df_communities_groupped[df_communities_groupped['Model'] != 'Random']
+
+    df_communities_groupped.sort_values(['Model', 'Environment', 'Temperature'], inplace=True)
+
+    df_communities_groupped.to_csv(f'tables/principle_3_communities{sfx}.csv', index=False)
+    df_communities_groupped.to_latex(f'tables/principle_3_communities{sfx}.tex', index=False, escape=False, float_format="%.2f")
+
+    rename_models = {
+        'gpt-5-nano' : 'GPT-5 Nano',
+        'gpt-5-mini' : 'GPT-5 Mini',
+        'Qwen-Qwen3.5-4B' : 'Qwen 3.5 4B',
+        'Qwen-Qwen3.5-2B' : 'Qwen 3.5 2B',
+        'Qwen-Qwen3.5-0.8B' : 'Qwen 3.5 0.8B',
+        'gpt-5-nano_cot' : 'GPT-5 Nano',
+        'gpt-5-mini_cot' : 'GPT-5 Mini',
+        'Qwen-Qwen3.5-4B_cot' : 'Qwen 3.5 4B',
+        'Qwen-Qwen3.5-2B_cot' : 'Qwen 3.5 2B',
+        'Qwen-Qwen3.5-0.8B_cot' : 'Qwen 3.5 0.8B',
+    }
+
+    rename_env = {
+        'school' : 'Sch',
+        'work' : 'Wrk',
+        'community' : 'Cmn',
+        'school_cot' : 'Sch',
+        'work_cot' : 'Wrk',
+        'community_cot' : 'Cmn',
+    }
+
+    df['Model'] = df['Model'].apply(lambda x: rename_models.get(x, x))
+
+    df_baseline = df[df['Environment'] == 'Baseline']
+    df_baseline = df_baseline[df_baseline['Model'] != 'Random']
+
+
+    df_nonbaseline = df[df['Environment'] != 'Baseline']
+    df_nonbaseline['Environment'] = df_nonbaseline['Environment'].apply(lambda x: rename_env.get(x, x))
+
+
+    fig, ax = plt.subplots(1 + int(environments), len(attributes) + int(mutual_acceptance) + int(communities), figsize=(5 * (len(attributes) + int(mutual_acceptance) + int(communities)), 5 * (1 + int(environments))), squeeze=False)
+
+
+    # df_random = df[df['Model'] == 'Random']
+    alpha = 0.1
+
+    ci_erorrorbar = 100 - alpha / num_tests
+
+
+    for i, y in enumerate(attributes):
+        print('attribute', y)
+        sns.barplot(data=df_baseline, y=y, x="Temperature", hue="Model", palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'], ax=ax[0, i], orient='v', errorbar=('ci', ci_erorrorbar))
+
+        if environments:
+            sns.barplot(data=df_nonbaseline, y=y, x="Environment", color='#2980b9', ax=ax[1, i], orient='v', errorbar=('ci', ci_erorrorbar))
+
+    df_communities_baseline = df_communities[df_communities['Environment'] == 'Baseline']
+    df_communities_baseline = df_communities_baseline[df_communities_baseline['Model'] != 'Random']
+    df_communities_baseline['Model'] = df_communities_baseline['Model'].apply(lambda x: rename_models.get(x, x))
+
+    if communities:
+        sns.barplot(data=df_communities_baseline, y='Modularity', x='Temperature', hue='Model', palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'], ax=ax[0, len(attributes)])
+        ax[0, len(attributes)].set_ylabel('Modularity')
+        ax[0 ,len(attributes)].set_title('')
+
+    if environments:
+        df_communities_nonbaseline = df_communities[df_communities['Environment'] != 'Baseline']
+        df_communities_nonbaseline['Environment'] = df_communities_nonbaseline['Environment'].apply(lambda x: rename_env.get(x, x))
+        df_communities_nonbaseline['Model'] = df_communities_nonbaseline['Model'].apply(lambda x: rename_models.get(x, x))
+
+
+        if communities:
+            sns.barplot(data=df_communities_nonbaseline, y='Modularity', x='Environment', color='#2980b9', ax=ax[1, len(attributes)])
+            ax[1, len(attributes)].set_ylabel('Modularity')
+            ax[1, len(attributes)].set_title('')
+
+    if mutual_acceptance:
+        sns.barplot(data=df_baseline, y='Mutual Acceptance Probability', x='Temperature', hue='Model', palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'], ax=ax[0, len(attributes) + int(communities)])
+
+        if environments:
+            sns.barplot(data=df_nonbaseline, y='Mutual Acceptance Probability', x='Environment', color='#2980b9', ax=ax[1, len(attributes) + int(communities)])
+
+    # put legend of ax[0, 0] on top of figure
+    # ax[0, 0].legend(loc='upper right', bbox_to_anchor=(1, 1))
+
+    for i in range(int(communities) + len(attributes) + int(mutual_acceptance)):
+        for j in range(1 + int(environments)):
+
+            ax[j, i].set_ylabel('')
+            ax[j, i].set_xlabel('')
+            ax[j, i].spines[['right', 'top']].set_visible(False)
+            ax[j, i].set_ylim(0, 1)
+            # ax[j, i].axhline(y=0, color='black', linestyle='--')
+
+    for i, attribute in enumerate(attributes):
+        ax[0, i].set_title(attribute)
+
+
+    for i in range(1 + len(attributes) + int(mutual_acceptance)):
+        for j in range(1 + int(environments)):
+            ax[j, i].legend().set_visible(False)
+
+    # use one of the legends of top row to create a legend for the whole figure
+    handles, labels = ax[0, 0].get_legend_handles_labels()
+
+    ax[0, 0].set_ylabel('Assortativity')
+    if environments:
+        ax[1, 0].set_ylabel('Assortativity')
+
+
+    if communities:
+        ax[0, len(attributes)].set_ylabel('Modularity')
+        if environments:
+            ax[1, len(attributes)].set_ylabel('Modularity')
+
+    if mutual_acceptance:
+        ax[0, len(attributes) + int(communities)].set_ylabel('Mutual Acceptance Prob')
+
+
+    # put figure legend on top of figure above titles
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.1), ncol=4)
+
+    fig.tight_layout()
+
+    fig.savefig(f'figures/assortativities{sfx}.pdf', bbox_inches='tight')
+
+
+def principle3_experiment_outfile(experiment, output_dir):
+    return str(os.path.join(os.fspath(output_dir), f"principle_3_{experiment['name']}.jsonl"))
+
+
+def principle3_build_experiment_record(experiment, output_dir, default_temperatures):
+    environment_role = experiment.get('environment')
+    if environment_role is None:
+        environment = None
+        role = 'friends'
+    else:
+        environment, role = environment_role
+
+    model = experiment['model']
+    return {
+        'experiment': experiment,
+        'name': experiment['name'],
+        'model': model,
+        'outfile': experiment.get('outfile', principle3_experiment_outfile(experiment, output_dir)),
+        'parameters': experiment['parameters'],
+        'temperatures': experiment.get('temperatures', default_temperatures),
+        'environment': environment,
+        'role': role,
+        'method': experiment.get('method', 'llm'),
+        'cot': experiment.get('COT', False),
+        'cot_config': experiment.get('cot_config'),
+        'profiles_filename': experiment.get('profiles_filename', PRINCIPLE3_DEFAULT_PROFILES_FILENAME),
+        'mutual_acceptance': experiment.get('mutual_acceptance', False),
+        'summary_group': experiment.get('summary_group', 'profiles'),
+        'metadata': {
+            'experiment_name': experiment['name'],
+            'summary_group': experiment.get('summary_group', 'profiles'),
+            'model': model,
+            'environment': environment if environment is not None else 'Baseline',
+            'role': role,
+            'cot': experiment.get('COT', False),
+            'profiles_filename': experiment.get('profiles_filename', PRINCIPLE3_DEFAULT_PROFILES_FILENAME),
+            'mutual_acceptance': experiment.get('mutual_acceptance', False),
+        },
+    }
+
+
+def principle3_build_cot_calibration_requests(experiment, output_dir, default_temperatures, sample_size=20, seed=0):
+    record = principle3_build_experiment_record(experiment, output_dir, default_temperatures)
+    n = record['parameters']['n_max']
+    temperature = record['temperatures'][0]
+    state = principle3_initialize_growth_state(n, temperature, record)
+    rng = random.Random(seed)
+    nodes = list(state['G'].nodes())
+    rng.shuffle(nodes)
+    nodes = nodes[:sample_size]
+
+    requests = []
+    for t in nodes:
+        request = principle3_build_selection_request(
+            state['G'],
+            t,
+            state['profiles'],
+            state['environment'],
+            state['role'],
+            True,
+            state['model'],
+        )
+        requests.append((t, request))
+    return record, requests
+
+
+def principle3_run_cot_budget_calibration(
+    experiments,
+    output_dir,
+    default_temperatures,
+    default_cot_config,
+    run_experiments=True,
+    calibrate=True,
+    calibration_sample_size=20,
+    calibration_max_new_tokens=65536,
+    calibration_percentile=0.90,
+    calibration_margin=1.5,
+    retry_token_buckets=(8192, 16384, 32768, 65536),
+    calibration_seed=0,
+    calibration_filename='principle_3_cot_budget_calibration.json',
+):
+    return run_cot_budget_calibration(
+        experiments,
+        output_dir,
+        default_temperatures,
+        default_cot_config,
+        build_calibration_requests=principle3_build_cot_calibration_requests,
+        parse_response=principle3_parse_selection_response,
+        calibration_filename=calibration_filename,
+        run_experiments=run_experiments,
+        calibrate=calibrate,
+        calibration_sample_size=calibration_sample_size,
+        calibration_max_new_tokens=calibration_max_new_tokens,
+        calibration_percentile=calibration_percentile,
+        calibration_margin=calibration_margin,
+        retry_token_buckets=retry_token_buckets,
+        calibration_seed=calibration_seed,
+    )
+
+
+def principle3_run_configured_experiments(experiments, output_dir, default_temperatures, run_experiments=True, run_analysis=True):
+    supported_models = set(filter_supported_models(sorted({experiment['model'] for experiment in experiments})))
+    outfiles_by_group = collections.defaultdict(list)
+    experiment_records = []
+    experiments_to_analyze = []
+
+    for experiment in experiments:
+        if not experiment.get('run', True):
+            continue
+
+        model = experiment['model']
+        if model not in supported_models:
+            print(f'Skipping {experiment["name"]}: {model} is not supported in this environment.')
+            continue
+
+        record = principle3_build_experiment_record(experiment, output_dir, default_temperatures)
+        experiment_records.append(record)
+
+        if experiment.get('include_in_summary', True):
+            outfiles_by_group[record['summary_group']].append(record['outfile'])
+
+        if experiment.get('analyze_detail', False):
+            experiments_to_analyze.append(record)
+
+    if run_experiments:
+        batch_groups = collections.defaultdict(list)
+        for record in experiment_records:
+            if record['model'].startswith('Qwen/') and record['method'] == 'llm' and record['experiment'].get('batch', True):
+                batch_key = (
+                    record['model'],
+                    record['cot'],
+                    record['mutual_acceptance'],
+                    record['profiles_filename'],
+                    json.dumps(record.get('cot_config'), sort_keys=True, default=str),
+                )
+                batch_groups[batch_key].append(record)
+                continue
+
+            principle3_run_network_formation_experiment(
+                outfile=record['outfile'],
+                method=record['method'],
+                model=record['model'],
+                environment=record['environment'],
+                role=record['role'],
+                cot=record['cot'],
+                cot_config=record.get('cot_config'),
+                profiles_filename=record['profiles_filename'],
+                mutual_acceptance=record['mutual_acceptance'],
+                temperatures=record['temperatures'],
+                metadata=record['metadata'],
+                **record['parameters'],
+            )
+
+        for records in batch_groups.values():
+            principle3_run_network_formation_experiments_batch(records)
+
+    if run_analysis:
+        for record in experiments_to_analyze:
+            principle3_analyze_experiments(record['outfile'])
+
+        if outfiles_by_group.get('profiles'):
+            principle3_get_table(outfiles_by_group['profiles'], environments=True, mutual_acceptance=False, communities=True)
+        if outfiles_by_group.get('lucky_number'):
+            principle3_get_table(
+                outfiles_by_group['lucky_number'],
+                sfx='_lucky_number',
+                attributes=['Location', 'Hobby', 'Favorite Color', 'Lucky Number'],
+                environments=False,
+                profiles_filename=PRINCIPLE3_LUCKY_NUMBER_PROFILES_FILENAME,
+                mutual_acceptance=False,
+                communities=False,
+            )
+        if outfiles_by_group.get('mutual_acceptance'):
+            principle3_get_table(
+                outfiles_by_group['mutual_acceptance'],
+                sfx='_mutual_acceptance',
+                environments=False,
+                mutual_acceptance=True,
+                communities=True,
+            )
+        if outfiles_by_group.get('cot'):
+            principle3_get_table(outfiles_by_group['cot'], sfx='_cot', environments=False, mutual_acceptance=False, communities=True)
+
+    return {
+        'supported_models': supported_models,
+        'outfiles_by_group': outfiles_by_group,
+        'experiment_records': experiment_records,
+        'experiments_to_analyze': experiments_to_analyze,
+    }
+
+# --- End Principle 3 profile-homophily utilities ---
+
+# --- Principle 5 small-world utilities ---
+
+def set_principle5_runtime_options(medium_size=28):
+    global MEDIUM_SIZE, SMALL_SIZE, BIGGER_SIZE
+    MEDIUM_SIZE = medium_size
+    SMALL_SIZE = 0.85 * MEDIUM_SIZE
+    BIGGER_SIZE = 1.5 * MEDIUM_SIZE
+    plt.rc('font', size=SMALL_SIZE)
+    plt.rc('axes', titlesize=MEDIUM_SIZE)
+    plt.rc('axes', labelsize=MEDIUM_SIZE)
+    plt.rc('xtick', labelsize=MEDIUM_SIZE)
+    plt.rc('ytick', labelsize=MEDIUM_SIZE)
+    plt.rc('legend', fontsize=SMALL_SIZE)
+    plt.rc('figure', titlesize=BIGGER_SIZE)
+
+def principle5_get_stars(p, num_tests=1, parenthesis=True):
+    if p < 0.001 / num_tests:
+        stars = '***'
+    elif p < 0.01 / num_tests:
+        stars = '**'
+    elif p < 0.05 / num_tests:
+        stars = '*'
+    else:
+        stars = ''
+
+    if parenthesis and stars != '':
+        return f'({stars})'
+    else:
+        return stars
+
+def principle5_barrat_weight_clustering_coefficient(G):
+
+    triangles = 0
+    triples = 0
+
+    for node in G.nodes():
+        for neighbor in G.neighbors(node):
+            for neighbor2 in G.neighbors(neighbor):
+                if neighbor2 in G.neighbors(node):
+                    triangles += 1
+
+                triples += 1
+
+    return triangles / triples
+
+def principle5_fit_beta_ws(G, k, method='binary_search', tol=0.01, max_iter=100):
+    if method == 'closed_form':
+        C = principle5_barrat_weight_clustering_coefficient(G)
+        C0 = 3 * (k - 1) / (2 * (2 * k - 1))
+        return 1 - (C / C0)**(1 / 3)
+
+    elif method == 'binary_search':
+
+        beta_max = 1
+        beta_min = 0.01
+
+        n = len(G)
+
+        C = nx.average_clustering(G)
+
+        i = 0
+
+        while True:
+            beta = (beta_max + beta_min) / 2
+
+            Gs_WS, _ = principle5_network_growth(n, k, beta, 0, method='W-S', model=None, environment=None, role=None)
+            G_WS = Gs_WS[-1]
+
+            C_WS = nx.average_clustering(G_WS)
+
+            if abs(C_WS - C) < tol:
+                return beta
+            elif C_WS < C:
+                beta_max = beta
+            else:
+                beta_min = beta
+
+            i += 1
+
+            if i >= max_iter:
+                return principle5_fit_beta_ws(G, k, method='closed_form')
+
+        return beta
+
+def principle5_network_growth(n, k, beta, temperature=None, environment=None, role='friends', model='gpt-5-mini', cot=False, cot_config=None, method='llm'):
+    G = nx.Graph()
+
+    # Create ring network
+    for i in range(n):
+        G.add_node(i)
+
+    for i in G.nodes():
+        G.add_edge(i, (i + 1) % n)
+
+    for i in G.nodes():
+        for j in G.nodes():
+            if 0 < abs(i - j) % (n - 1 - k / 2) <= k / 2:
+                G.add_edge(i, j)
+
+    Gs = []
+    results = []
+
+    for i in G.nodes():
+        neighbors = list(G.neighbors(i))
+        for j in neighbors:
+            if 0 < (j - i) % n <= k / 2:
+                if np.random.uniform() <= beta:
+                        while True:
+                            if method == 'W-S':
+                                v = random.choice(list(set(G.nodes())))
+                            elif method == 'llm':
+                                result = principle5_select_neighbor(G, i, temperature, model, environment, role, cot=cot, cot_config=cot_config)
+                                if not result:
+                                    break
+                                v = result['name']
+
+                            if v != i and v not in G.neighbors(i):
+                                if method == 'llm':
+                                    results.append(result)
+                                G.add_edge(i, v)
+                                G.remove_edge(i, j)
+                                break
+
+
+        Gs.append(G.copy())
+
+    return Gs, results
+
+def principle5_build_neighbor_request(G, t, environment, role, cot, model):
+    features = []
+    for v in G.nodes():
+        if v != t and v not in G.neighbors(t):
+            features.append({'name' : v, 'neighbors' : list(G.neighbors(v))})
+
+    if cot:
+        output_format = f"""
+    {{
+        "reason" : reason for selecting the person,
+        "name" : name of the person you selected
+    }}
+        """
+    else:
+        output_format = f"""
+    {{
+        "name" : name of the person you selected,
+        "reason" : reason for selecting the person
+    }}
+        """
+
+    candidate_names = [feature['name'] for feature in features]
+    response_schema = build_response_schema(candidate_names)
+    use_structured_output = not (model.startswith('Qwen/') and cot)
+    allowed_names_json = json.dumps(candidate_names, ensure_ascii=False)
+
+    prompt = f"""
+    # Task
+    {f'You are in a {environment}.' if environment else ''}Your task is to select a person to be {role} with.
+
+    # Input
+    The input is a list of dictionaries. Each dictionary has two keys: 'name', 'neighbors'.
+    'name' is the name of the person, and 'neighbors' is a list of the person's friends.
+    The data is given below after chevrons:
+    <DEGREES>
+    {json.dumps(features, separators=(',', ':'))}
+    </DEGREES>
+
+    # Output
+    The output should be given in JSON format with the following structure
+
+    {output_format}
+
+    # Notes
+    * Return exactly one JSON object.
+    * Do not explain your reasoning outside the JSON object.
+    * Do not write markdown fences.
+    * Do not write any text before or after the JSON object.
+    * The value of "name" must be exactly one of these values: {allowed_names_json}
+    * Do not rename the person.
+    * Do not output labels such as "person 0", "Person 0", or "candidate 0".
+    * The final answer must be exactly one JSON object and must not contain text after the JSON object.
+    """
+
+    return {
+        'prompt': prompt,
+        'response_schema': response_schema if use_structured_output else None,
+        'candidate_names': set(candidate_names),
+    }
+
+def principle5_parse_neighbor_response(ans, request):
+    result = first_json_object(ans)
+    if not isinstance(result, dict) or 'name' not in result:
+        raise ValueError('Could not parse a valid JSON object with a name field.')
+    normalized_name = normalize_name(result['name'], request['candidate_names'])
+    if normalized_name is None:
+        raise ValueError(f"Invalid candidate name: {result['name']}")
+    result['name'] = normalized_name
+    return result
+
+def principle5_select_neighbor(G, t, temperature, model, environment, role, cot, cot_config=None):
+    request = principle5_build_neighbor_request(G, t, environment, role, cot, model)
+    for i in range(10):
+        try:
+            ans = get_response(request['prompt'], model, temperature=temperature, response_schema=request['response_schema'], cot=cot, cot_config=cot_config)
+            result = principle5_parse_neighbor_response(ans, request)
+            print('NEW EDGE', result)
+            return result
+        except Exception as e:
+            print(e)
+
+def principle5_initialize_ws_graph(n, k):
+    G = nx.Graph()
+    for i in range(n):
+        G.add_node(i)
+
+    for i in G.nodes():
+        G.add_edge(i, (i + 1) % n)
+
+    for i in G.nodes():
+        for j in G.nodes():
+            if 0 < abs(i - j) % (n - 1 - k / 2) <= k / 2:
+                G.add_edge(i, j)
+
+    return G
+
+def principle5_initialize_growth_state(n, k, beta, temperature, experiment_record):
+    return {
+        'n': n,
+        'k': k,
+        'beta': beta,
+        'temperature': temperature,
+        'temperature_label': 'default' if temperature is None else temperature,
+        'model': experiment_record['model'],
+        'environment': experiment_record['environment'],
+        'role': experiment_record['role'],
+        'cot': experiment_record['cot'],
+        'cot_config': experiment_record.get('cot_config'),
+        'outfile': experiment_record['outfile'],
+        'metadata': experiment_record['metadata'],
+        'G': principle5_initialize_ws_graph(n, k),
+        'node_order': list(range(n)),
+        'node_idx': 0,
+        'neighbors': None,
+        'neighbor_idx': 0,
+        'pending_i': None,
+        'pending_j': None,
+        'graphs': [],
+        'reasons': [],
+    }
+
+def principle5_pending_growth_states_for_experiment(experiment_record):
+    parameters = experiment_record['parameters']
+    temperatures = experiment_record['temperatures']
+    outfile = experiment_record['outfile']
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    saved_scenarios = set()
+    if os.path.exists(outfile):
+        with open(outfile) as f:
+            lines = f.read().splitlines()
+        for line in lines:
+            scenario = json.loads(line)
+            saved_scenarios.add((scenario['n'], scenario['simulation'], scenario['k'], scenario['beta'], scenario['temperature']))
+
+    print(f'Loaded {len(saved_scenarios)} completed simulations from {outfile}')
+    states = []
+    k = parameters['k']
+    beta = experiment_record['beta']
+    for n in range(parameters['n_min'], parameters['n_max'] + 1, parameters['n_step']):
+        for i in range(parameters['num_simulations']):
+            for temperature in temperatures:
+                temperature_label = 'default' if temperature is None else temperature
+                if (n, i, k, beta, temperature_label) in saved_scenarios:
+                    print(f'Skipping simulation for n={n}, i={i}, k={k}, beta={beta}, temperature={temperature_label}')
+                    continue
+                print(f'Queueing simulation for n={n}, i={i}, k={k}, beta={beta}, temperature={temperature_label}, outfile={outfile}')
+                state = principle5_initialize_growth_state(n, k, beta, temperature, experiment_record)
+                state['simulation'] = i
+                states.append(state)
+    return states
+
+def principle5_advance_state_to_next_request(state):
+    while state['node_idx'] < len(state['node_order']):
+        i = state['node_order'][state['node_idx']]
+        if state['neighbors'] is None:
+            state['neighbors'] = list(state['G'].neighbors(i))
+            state['neighbor_idx'] = 0
+
+        while state['neighbor_idx'] < len(state['neighbors']):
+            j = state['neighbors'][state['neighbor_idx']]
+            state['neighbor_idx'] += 1
+            if 0 < (j - i) % state['n'] <= state['k'] / 2:
+                if np.random.uniform() <= state['beta']:
+                    state['pending_i'] = i
+                    state['pending_j'] = j
+                    return True
+
+        state['graphs'].append(state['G'].copy())
+        state['node_idx'] += 1
+        state['neighbors'] = None
+        state['neighbor_idx'] = 0
+
+    return False
+
+def principle5_apply_rewire_result(state, result):
+    i = state['pending_i']
+    j = state['pending_j']
+    if result:
+        v = result['name']
+        if v != i and v not in state['G'].neighbors(i):
+            state['reasons'].append(result)
+            state['G'].add_edge(i, v)
+            state['G'].remove_edge(i, j)
+    state['pending_i'] = None
+    state['pending_j'] = None
+
+def principle5_write_growth_state(state):
+    temp = {
+        'n' : state['n'],
+        'k' : state['k'],
+        'beta' : state['beta'],
+        'temperature' : state['temperature_label'],
+        'simulation' : state['simulation'],
+        'graphs' : [nx.to_dict_of_lists(G) for G in state['graphs']],
+        'reasons' : state['reasons'],
+        'model' : state['model'],
+        'environment' : state['environment'] if state['environment'] is not None else 'Baseline',
+        'role' : state['role'],
+        'cot' : state['cot'],
+    }
+    if state['metadata']:
+        temp.update(state['metadata'])
+    with open(state['outfile'], 'a+') as f:
+        f.write(json.dumps(temp) + '\n')
+        f.flush()
+
+def principle5_run_network_formation_experiments_batch(experiment_records):
+    if not experiment_records:
+        return
+
+    model = experiment_records[0]['model']
+    cot = experiment_records[0]['cot']
+    cot_config = experiment_records[0].get('cot_config')
+    active_states = []
+    for experiment_record in experiment_records:
+        active_states.extend(principle5_pending_growth_states_for_experiment(experiment_record))
+
+    if not active_states:
+        print(f'All batched simulations already completed for {model}. Skipping inference.')
+        return
+
+    print(f'Running {len(active_states)} batched simulations for {model}, cot={cot}')
+    while active_states:
+        ready_states = []
+        completed_states = []
+        for state in active_states:
+            if principle5_advance_state_to_next_request(state):
+                ready_states.append(state)
+            else:
+                completed_states.append(state)
+
+        for state in completed_states:
+            principle5_write_growth_state(state)
+
+        if not ready_states:
+            break
+
+        requests_by_temperature = collections.defaultdict(list)
+        for state in ready_states:
+            print(f'Rewiring node {state["pending_i"]} in {state["metadata"]["experiment_name"]}, simulation={state["simulation"]}')
+            request = principle5_build_neighbor_request(
+                state['G'],
+                state['pending_i'],
+                state['environment'],
+                state['role'],
+                state['cot'],
+                state['model'],
+            )
+            requests_by_temperature[state['temperature']].append((state, request))
+
+        results_by_state_id = {}
+        for temperature, batch_items in requests_by_temperature.items():
+            remaining = list(batch_items)
+            for attempt in range(10):
+                if not remaining:
+                    break
+
+                prompts = [request['prompt'] for _, request in remaining]
+                response_schemas = [request['response_schema'] for _, request in remaining]
+                answers = get_responses(
+                    prompts,
+                    model,
+                    temperature=temperature,
+                    response_schemas=response_schemas,
+                    cot=cot,
+                    cot_config=cot_config,
+                )
+
+                next_remaining = []
+                for (state, request), ans in zip(remaining, answers):
+                    try:
+                        result = principle5_parse_neighbor_response(ans, request)
+                        print('NEW EDGE', result)
+                        results_by_state_id[id(state)] = result
+                    except Exception as e:
+                        print(e)
+                        next_remaining.append((state, request))
+                remaining = next_remaining
+
+            for state, _ in remaining:
+                results_by_state_id[id(state)] = None
+
+        active_states = []
+        for state in ready_states:
+            principle5_apply_rewire_result(state, results_by_state_id.get(id(state)))
+            active_states.append(state)
+
+def principle5_run_network_formation_experiment(n_min, n_max, n_step, k, beta, num_simulations, outfile, temperatures=None, environment=None, role='friends', method='llm', model='gpt-5-mini', cot=False, cot_config=None, metadata=None):
+    if temperatures is None:
+        temperatures = [None]
+
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    saved_scenarios = set()
+
+    if os.path.exists(outfile):
+        with open(outfile) as f:
+            lines = f.read().splitlines()
+
+        for line in lines:
+            scenario = json.loads(line)
+            saved_scenarios.add((scenario['n'], scenario['simulation'], scenario['k'], scenario['beta'], scenario['temperature']))
+
+    expected_scenarios = {
+        (n, i, k, beta, 'default' if temperature is None else temperature)
+        for n in range(n_min, n_max + 1, n_step)
+        for i in range(num_simulations)
+        for temperature in temperatures
+    }
+
+    if expected_scenarios.issubset(saved_scenarios):
+        print(f'All simulations already completed for {outfile}. Skipping inference.')
+        return
+
+    print(f'Loaded {len(saved_scenarios)} completed simulations from {outfile}')
+
+    f = open(outfile, 'a+')
+
+    for n in range(n_min, n_max + 1, n_step):
+        for i in range(num_simulations):
+            for temperature in temperatures:
+                temperature_label = 'default' if temperature is None else temperature
+                if (n, i, k, beta, temperature_label) in saved_scenarios:
+                    print(f'Skipping simulation for n={n}, i={i}, k={k}, beta={beta}, temperature={temperature_label}')
+                    continue
+                else:
+                    print(f'Running simulation for n={n}, i={i}, k={k}, beta={beta}, temperature={temperature_label}')
+
+                    Gs, reasons = principle5_network_growth(n, k, beta, temperature=temperature, method=method, model=model, environment=environment, role=role, cot=cot, cot_config=cot_config)
+
+                    temp = {
+                        'n' : n,
+                        'k' : k,
+                        'beta' : beta,
+                        'temperature' : temperature_label,
+                        'simulation' : i,
+                        'graphs' : [nx.to_dict_of_lists(G) for G in Gs],
+                        'reasons' : reasons,
+                        'model' : model,
+                        'environment' : environment if environment is not None else 'Baseline',
+                        'role' : role,
+                        'cot' : cot,
+                    }
+                    if metadata:
+                        temp.update(metadata)
+
+                    f.write(json.dumps(temp) + '\n')
+                    f.flush()
+
+                if method != 'llm':
+                    break
+
+    f.close()
+
+def principle5_draw_graph(G, ax, G0=None, use_netgraph=True):
+    if not use_netgraph:
+        pos = nx.circular_layout(G)
+        nx.draw(G, pos, ax=ax, node_size=10, width=1.5, node_color='#d35400', alpha=0.7, edge_color='#2c3e50')
+    else:
+        netgraph.Graph(G, ax=ax, node_size=2.5, edge_width=1, node_color='#d35400', edge_color='#2c3e50', node_layout='circular', edge_layout='bundled', edge_layout_kwargs=dict(k=2000))
+    ax.set_axis_off()
+
+def principle5_analyze_experiments(filename, suffix='', fit_beta_method='binary_search'):
+    os.makedirs('figures/principle_5', exist_ok=True)
+
+    with open(filename) as f:
+        lines = f.read().splitlines()
+
+    data = []
+
+    for line in lines:
+        data.append(json.loads(line))
+
+
+    average_shortest_path_lengths = collections.defaultdict(list)
+    average_clustering_coefficients = collections.defaultdict(list)
+    graphs = {}
+    hat_betas = []
+    temperatures = set()
+
+    for d in data:
+        Gs = []
+        for graph in d['graphs']:
+            G = nx.Graph()
+
+            for k, v in graph.items():
+                k = int(k)
+                G.add_node(k)
+                for n in v:
+                    G.add_edge(k, n)
+
+            Gs.append(G)
+
+        hat_beta = principle5_fit_beta_ws(Gs[-1], d['k'], method=fit_beta_method)
+
+        average_shortest_path_len = [nx.average_shortest_path_length(G) for G in Gs]
+        average_clustering_coefficient = [nx.average_clustering(G) for G in Gs]
+        average_shortest_path_lengths[d['n'], d['k'], d['beta'], d['temperature']].append(average_shortest_path_len)
+        average_clustering_coefficients[d['n'], d['k'], d['beta'], d['temperature']].append(average_clustering_coefficient)
+
+        Gs_WS_estimated, _ = principle5_network_growth(d['n'], d['k'], hat_beta, d['temperature'], method='W-S', model=None, environment=None, role=None)
+
+        G_WS_estimated = Gs_WS_estimated[-1]
+
+        average_shortest_path_len_WS_estimated = nx.average_shortest_path_length(G_WS_estimated)
+        average_clustering_coefficient_WS_estimated = nx.average_clustering(G_WS_estimated)
+
+        hat_beta_record = {
+            'n' : d['n'],
+            'k' : d['k'],
+            'beta' : d['beta'],
+            'hat_beta' : hat_beta,
+            'Temperature' : d['temperature'],
+            'Simulation' : d['simulation'],
+            'Difference in $L$' : average_shortest_path_len_WS_estimated - average_shortest_path_len[-1],
+            'Difference in $C$' : average_clustering_coefficient_WS_estimated - average_clustering_coefficient[-1],
+            'Avg. Shortest Path Length' : average_shortest_path_len[-1],
+            'Avg. Clustering Coefficient' : average_clustering_coefficient[-1],
+            'Avg. Shortest Path Length WS' : average_shortest_path_len_WS_estimated,
+            'Avg. Clustering Coefficient WS' : average_clustering_coefficient_WS_estimated
+        }
+
+        hat_betas.append(hat_beta_record)
+
+        temperatures.add(d['temperature'])
+
+        graphs[d['n'], d['k'], d['beta'], d['temperature'], d['simulation']] = Gs[-1].copy()
+
+    fig_final, ax_final = plt.subplots(1, 2 + len(average_shortest_path_lengths), figsize=(5 * (2 + len(average_shortest_path_lengths)), 5), squeeze=False, gridspec_kw={'width_ratios' : [1] * len(average_shortest_path_lengths) + [0.5, 0.5]})
+
+    ax_final[0, -1].spines[['right', 'top']].set_visible(False)
+    ax_final[0, -2].spines[['right', 'top']].set_visible(False)
+
+    i = 0
+
+    for key in sorted(graphs.keys()):
+        if key[-1] == 0:
+            G = graphs[key]
+            principle5_draw_graph(G, ax_final[0, i])
+            ax_final[0, i].set_title(f'Temperature = {key[3]}')
+
+            i += 1
+
+    ax_final[0, -1].set_ylabel('$L$')
+    ax_final[0, -2].set_ylabel('$C$')
+
+
+    palette = ['#2980b9', '#f1c40f', '#7f8c8d', '#d35400', '#34495e', '#e67e22',]
+
+    fig, ax = plt.subplots(2, len(average_shortest_path_lengths), figsize=(5 * len(average_shortest_path_lengths), 10), squeeze=False)
+    fig_combined, ax_combined = plt.subplots(1, 2, figsize=(10, 5), squeeze=False)
+
+    ax_combined[0, -1].spines[['right', 'top']].set_visible(False)
+    ax_combined[0, -2].spines[['right', 'top']].set_visible(False)
+
+    ax_combined[0, 0].set_ylabel('$L$')
+    ax_combined[0, 1].set_ylabel('$C$')
+    ax_combined[0, 0].set_xlabel('t')
+    ax_combined[0, 1].set_xlabel('t')
+
+
+    for i, (k, c) in enumerate(zip(sorted(average_shortest_path_lengths.keys()), palette)):
+        v = average_shortest_path_lengths[k]
+        v = np.array(v)
+
+        mean = v.mean(axis=0)
+        std = v.std(axis=0)
+
+        ci = 1.96 * std / np.sqrt(len(v))
+
+        ax[0, i].plot(mean, color='#34495e', label='LLM')
+        ax[0, i].fill_between(np.arange(len(mean)), mean - ci, mean + ci, alpha=0.2, color='#34495e')
+
+        ax[0, i].set_title(f'Temperature = {k[3]}')
+
+        ax[0, i].set_xlabel('t')
+        ax[0, i].set_ylabel('$L$')
+
+        ax[0, i].set_xlim(0, len(mean) - 1)
+
+        ax_combined[0, 0].plot(mean, color=c, label=str(k[3]))
+        ax_combined[0, 0].fill_between(np.arange(len(mean)), mean - ci, mean + ci, alpha=0.2, color=c)
+
+        ax_final[0, -1].bar(i, mean[-1], yerr=2*ci[-1], color=c, alpha=0.5, label=str(k[3]))
+
+        for k_prime in sorted(average_shortest_path_lengths.keys()):
+            if k[-1] > k_prime[-1]:
+                print(f'T-test for Temperatures {k[-1]} and {k_prime[-1]} for $L$: {scipy.stats.ttest_ind([x[-1] for x in average_shortest_path_lengths[k]], [x[-1] for x in average_shortest_path_lengths[k_prime]], equal_var=False, alternative="less")}')
+
+
+    for i, (k, c) in enumerate(zip(sorted(average_clustering_coefficients.keys()), palette)):
+        v = average_clustering_coefficients[k]
+        v = np.array(v)
+
+        mean = v.mean(axis=0)
+        std = v.std(axis=0)
+
+        ci = 1.96 * std / np.sqrt(len(v))
+
+        ax[1, i].plot(mean, color='#34495e', label='LLM')
+        ax[1, i].fill_between(np.arange(len(mean)), mean - ci, mean + ci, alpha=0.2, color='#34495e')
+
+        ax[1, i].set_ylabel('$C$')
+
+        ax[1, i].set_xlabel('t')
+
+        ax[1, i].set_xlim(0, len(mean) - 1)
+
+        ax_combined[0, 1].plot(mean, color=c, label=str(k[3]))
+        ax_combined[0, 1].fill_between(np.arange(len(mean)), mean - ci, mean + ci, alpha=0.2, color=c)
+
+        ax_final[0, -2].bar(i, mean[-1], yerr=2*ci[-1], color=c, alpha=0.5, label=str(k[3]))
+
+        for k_prime in sorted(average_clustering_coefficients.keys()):
+            if k[-1] > k_prime[-1]:
+                print(f'T-test for Temperatures {k[-1]} and {k_prime[-1]} for $C$: {scipy.stats.ttest_ind([x[-1] for x in average_clustering_coefficients[k]], [x[-1] for x in average_clustering_coefficients[k_prime]], equal_var=False, alternative="less")}')
+
+    # Null models
+    average_shortest_path_lengths_null = { 'W-S' : collections.defaultdict(list), 'random' : collections.defaultdict(list) }
+    average_clustering_coefficients_null = { 'W-S' : collections.defaultdict(list), 'random' : collections.defaultdict(list) }
+
+    for d in data:
+        for method in ['W-S']:
+            if method == 'random':
+                Gs, _ = principle5_network_growth(d['n'], d['k'], 1, d['temperature'], method='W-S', model=None, environment=None, role=None)
+            else:
+                Gs, _ = principle5_network_growth(d['n'], d['k'], d['beta'], d['temperature'], method=method, model=None, environment=None, role=None)
+            average_shortest_path_lengths_null[method][d['n'], d['k'], d['beta'], d['temperature']].append([nx.average_shortest_path_length(G) for G in Gs])
+            average_clustering_coefficients_null[method][d['n'], d['k'], d['beta'], d['temperature']].append([nx.average_clustering(G) for G in Gs])
+
+    for method in ['W-S']:
+        for i, (k, v) in enumerate(average_shortest_path_lengths_null[method].items()):
+            v = np.array(v)
+
+            mean = v.mean(axis=0)
+            std = v.std(axis=0)
+
+            ci = 1.96 * std / np.sqrt(len(v))
+
+            if method == 'W-S':
+                ax[0, i].plot(mean, color='#d35400', linestyle='--', label=method)
+            elif method == 'random':
+                ax[0, i].plot(mean, color='#d35400', linestyle=':', label=method)
+
+            ax[0, i].fill_between(np.arange(len(mean)), mean - ci, mean + ci, alpha=0.2, color='#d35400', hatch='||')
+
+            if i == 0:
+                ax_combined[0, 0].plot(mean, color='#d35400', linestyle='--', label=method)
+                ax_combined[0, 0].fill_between(np.arange(len(mean)), mean - ci, mean + ci, alpha=0.2, color='#d35400', hatch='||')
+
+                ax_final[0, -1].bar(len(average_shortest_path_lengths), mean[-1], yerr=2*ci[-1], color='#d35400', alpha=0.5, label=method)
+
+            for k_prime in sorted(average_shortest_path_lengths.keys()):
+                if k == k_prime:
+                    print(f'T-test for Temperature {k[-1]} and W-S for $L$ (two-sided): {scipy.stats.ttest_ind([x[-1] for x in average_shortest_path_lengths_null[method]], [x[-1] for x in average_shortest_path_lengths[k_prime]], equal_var=False, alternative="two-sided")}')
+
+
+    for method in ['W-S']:
+        for i, (k, v) in enumerate(average_clustering_coefficients_null[method].items()):
+            v = np.array(v)
+
+            mean = v.mean(axis=0)
+            std = v.std(axis=0)
+
+            ci = 1.96 * std / np.sqrt(len(v))
+
+            if method == 'W-S':
+                ax[1, i].plot(mean, color='#d35400', linestyle='--', label=method)
+            elif method == 'random':
+                ax[1, i].plot(mean, color='#d35400', linestyle=':', label=method)
+
+            ax[1, i].fill_between(np.arange(len(mean)), mean - ci, mean + ci, alpha=0.2, color='#d35400', hatch='||')
+
+            if i == 0:
+                ax_combined[0, 1].plot(mean, color='#d35400', linestyle='--', label=method)
+                ax_combined[0, 1].fill_between(np.arange(len(mean)), mean - ci, mean + ci, alpha=0.2, color='#d35400', hatch='||')
+
+                ax_final[0, -2].bar(len(average_shortest_path_lengths), mean[-1], yerr=2*ci[-1], color='#d35400', alpha=0.5, label=method)
+
+            for k_prime in sorted(average_clustering_coefficients.keys()):
+                if k == k_prime:
+                    print(f'T-test for Temperature {k[-1]} and W-S for $C$ (greater): {scipy.stats.ttest_ind([x[-1] for x in average_clustering_coefficients_null[method]], [x[-1] for x in average_clustering_coefficients[k_prime]], equal_var=False, alternative="greater")}')
+    ax_final[0, -1].set_xticks([])
+    ax_final[0, -2].set_xticks([])
+
+    ax_final[0, -1].legend(bbox_to_anchor=(1, 0.5), loc='center left', frameon=False)
+
+
+    for i in range(len(average_shortest_path_lengths)):
+        ax[0, i].legend(loc='upper left')
+        ax[1, i].legend(loc='upper left')
+
+        ax[0, i].set_ylim(2, 3)
+
+    ax_combined[0, 0].legend(loc='upper right')
+
+    fig_combined.tight_layout()
+
+    fig.tight_layout()
+
+    fig.savefig(f'figures/principle_5/principle_5_overall{f"_{suffix}" if suffix else ""}.pdf')
+
+    fig_combined.savefig(f'figures/principle_5/principle_5_overall_combined{f"_{suffix}" if suffix else ""}.pdf')
+
+    fig_final.tight_layout()
+
+    fig_final.savefig(f'figures/principle_5/principle_5_final_graphs{f"_{suffix}" if suffix else ""}.pdf')
+
+    hat_betas = pd.DataFrame.from_records(hat_betas)
+
+    fig_estimated, ax_estimated = plt.subplots(1, 2, figsize=(10, 5), squeeze=False)
+
+    sns.boxplot(data=hat_betas, x='Temperature', y='hat_beta', ax=ax_estimated[0, 0], palette=palette)
+    ax_estimated[0, 0].set_ylabel('Estimated $\\hat{\\beta}$')
+
+    sns.violinplot(data=hat_betas, x='Temperature', y='Difference in $L$', ax=ax_estimated[0, 1], palette=palette)
+
+    for j, temperature in enumerate(temperatures):
+        df_temp = hat_betas.query('Temperature == @temperature')
+        t, p = scipy.stats.ttest_ind(df_temp['Avg. Shortest Path Length'], df_temp['Avg. Shortest Path Length WS'], equal_var=False, alternative="two-sided")
+        print(f'T-test for average path length vs WS with estimated beta for temperature {temperature}: t = {t}, p = {p}')
+        ax_estimated[0, 1].text(j, 0.9, f'P = {p:.2f}', ha='center', fontsize=0.65*SMALL_SIZE)
+        ax_estimated[0, 1].set_ylim(-0.6, 0.85)
+
+    ax_estimated[0, 0].spines[['right', 'top']].set_visible(False)
+    ax_estimated[0, 1].spines[['right', 'top']].set_visible(False)
+
+
+    fig_estimated.tight_layout()
+
+    fig_estimated.savefig(f'figures/principle_5/principle_5_estimated_beta{f"_{suffix}" if suffix else ""}.png')
+
+def principle5_plot_multiple_networks_small_world(filename, outfile):
+
+    with open(filename) as f:
+        lines = f.read().splitlines()
+
+    data = []
+
+    for line in lines:
+        data.append(json.loads(line))
+
+    records = []
+
+    temperatures = set()
+    seen = set()
+
+    for d in data:
+        Gs = []
+        for graph in d['graphs']:
+            G = nx.Graph()
+
+            for k, v in graph.items():
+                k = int(k)
+                G.add_node(k)
+                for n in v:
+                    G.add_edge(k, n)
+
+            Gs.append(G)
+
+        try:
+            average_shortest_path_len = nx.average_shortest_path_length(Gs[-1])
+            average_clustering_coefficient = nx.average_clustering(Gs[-1])
+
+            record = {
+                'n' : d['n'],
+                'log(n)' : np.log(d['n']),
+                '1/log(n)' : 1 / np.log(d['n']),
+                'k' : d['k'],
+                'beta' : d['beta'],
+                'temperature' : d['temperature'],
+                'simulation' : d['simulation'],
+                '$L$' : average_shortest_path_len,
+                '$C$' : average_clustering_coefficient
+            }
+
+
+            temperatures.add(d['temperature'])
+            records.append(record)
+
+
+            seen.add((d['n'], d['k'], d['beta']))
+        except:
+            pass
+
+    for n, k, beta in seen:
+        try:
+            Gs, _ = principle5_network_growth(n, k, beta, 0, method='W-S')
+
+            average_shortest_path_len = nx.average_shortest_path_length(Gs[-1])
+            average_clustering_coefficient = nx.average_clustering(Gs[-1])
+
+            record = {
+                'n' : n,
+                'log(n)' : np.log(n),
+                '1/log(n)' : 1 / np.log(n),
+                'k' : k,
+                'beta' : beta,
+                'temperature' : 'W-S',
+                'simulation' : 0,
+                '$L$' : average_shortest_path_len,
+                '$C$' : average_clustering_coefficient
+            }
+
+            records.append(record)
+        except:
+            pass
+
+    df = pd.DataFrame.from_records(records)
+
+
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5), squeeze=False)
+
+    palette = ['#2980b9', '#f1c40f', '#7f8c8d', '#d35400', '#34495e', '#e67e22',]
+
+
+    for i, temperature in enumerate(temperatures):
+        regress_result = scipy.stats.linregress(df.query('temperature == @temperature')['log(n)'], df.query('temperature == @temperature')['$L$'])
+        stars = '***' if regress_result.pvalue < 0.001 else '**' if regress_result.pvalue < 0.01 else '*' if regress_result.pvalue < 0.05 else ''
+
+        sns.regplot(data=df.query('temperature == @temperature'), x='log(n)', y='$L$', ax=ax[0, 0], label=f'{temperature}, $a$ = {regress_result.slope:.2f} ({stars})', color=palette[i])
+
+
+    regress_result = scipy.stats.linregress(df.query(f'temperature == "W-S"')['log(n)'], df.query(f'temperature == "W-S"')['$L$'])
+    stars = '***' if regress_result.pvalue < 0.001 else '**' if regress_result.pvalue < 0.01 else '*' if regress_result.pvalue < 0.05 else ''
+    sns.regplot(data=df.query(f'temperature == "W-S"'), x='log(n)', y='$L$', ax=ax[0, 0], label=f'W-S, $a$ = {regress_result.slope:.2f} ({stars})', color=palette[len(temperatures)])
+
+    # ax[0, 0].legend(fontsize=0.75*SMALL_SIZE, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=1)
+
+    ax[0, 0].legend(fontsize=0.5*SMALL_SIZE, loc='lower right')
+    ax[0, 0].spines[['right', 'top']].set_visible(False)
+
+    for i, temperature in enumerate(temperatures):
+        regress_result = scipy.stats.linregress(df.query('temperature == @temperature')['1/log(n)'], df.query('temperature == @temperature')['$C$'])
+        stars = '(***)' if regress_result.pvalue < 0.001 else '(**)' if regress_result.pvalue < 0.01 else '(*)' if regress_result.pvalue < 0.05 else ''
+        sns.regplot(data=df.query('temperature == @temperature'), x='1/log(n)', y='$C$', ax=ax[0, 1], label=f'{temperature}, $a$ = {regress_result.slope:.2f} {stars}', color=palette[i])
+
+    regress_result = scipy.stats.linregress(df.query(f'temperature == "W-S"')['1/log(n)'], df.query(f'temperature == "W-S"')['$C$'])
+    stars = '(***)' if regress_result.pvalue < 0.001 else '(**)' if regress_result.pvalue < 0.01 else '(*)' if regress_result.pvalue < 0.05 else ''
+    sns.regplot(data=df.query(f'temperature == "W-S"'), x='1/log(n)', y='$C$', ax=ax[0, 1], label=f'W-S, $a$ = {regress_result.slope:.2f} {stars}', color=palette[len(temperatures)])
+
+    # ax[0, 1].legend(fontsize=0.75*SMALL_SIZE, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=1)
+
+    ax[0, 1].legend(fontsize=0.5*SMALL_SIZE, loc='lower right')
+
+    ax[0, 1].spines[['right', 'top']].set_visible(False)
+
+    fig.tight_layout()
+
+    fig.savefig(outfile, dpi=300, bbox_inches='tight')
+
+def principle5_get_table(filenames, sfx=''):
+    os.makedirs('figures/principle_5', exist_ok=True)
+    os.makedirs('tables', exist_ok=True)
+
+    records_coefficients = []
+    sns.set_palette(['#2980b9', '#f1c40f', '#7f8c8d', '#d35400', '#34495e', '#e67e22',])
+
+    rename_models = {
+        'gpt-5-nano' : 'GPT-5 Nano',
+        'gpt-5-mini' : 'GPT-5 Mini',
+        'Qwen-Qwen3.5-4B' : 'Qwen 3.5 4B',
+        'Qwen-Qwen3.5-2B' : 'Qwen 3.5 2B',
+        'Qwen-Qwen3.5-0.8B' : 'Qwen 3.5 0.8B',
+        'gpt-5-nano_cot' : 'GPT-5 Nano',
+        'gpt-5-mini_cot' : 'GPT-5 Mini',
+        'Qwen-Qwen3.5-4B_cot' : 'Qwen 3.5 4B',
+        'Qwen-Qwen3.5-2B_cot' : 'Qwen 3.5 2B',
+        'Qwen-Qwen3.5-0.8B_cot' : 'Qwen 3.5 0.8B',
+    }
+
+    rename_env = {
+        'school' : 'School',
+        'work' : 'Work',
+        'community' : 'Community',
+        'school_cot' : 'School',
+        'work_cot' : 'Work',
+        'community_cot' : 'Community',
+    }
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5), squeeze=False)
+
+    for filename in filenames:
+        suffix = os.path.split(os.path.splitext(filename)[0])[-1]
+        suffix = suffix.split('+')
+
+        if len(suffix) == 3:
+            model = suffix[-2]
+            environment = suffix[-1]
+        elif len(suffix) == 2:
+            model = suffix[-1]
+            environment = 'Baseline'
+        else:
+            model = suffix[-1]
+            environment = 'Baseline'
+
+        with open(filename) as f:
+            lines = f.read().splitlines()
+
+        data = []
+
+        for line in lines:
+            data.append(json.loads(line))
+
+        records = []
+
+        temperatures = set()
+        seen = set()
+
+        for d in data:
+            if 'model' in d:
+                model = str(d['model']).replace('/', '-')
+                if d.get('cot') and not model.endswith('_cot'):
+                    model = f'{model}_cot'
+                environment = d.get('environment', 'Baseline')
+                if environment is None:
+                    environment = 'Baseline'
+                if d.get('cot') and environment != 'Baseline' and not str(environment).endswith('_cot'):
+                    environment = f'{environment}_cot'
+
+            Gs = []
+            for graph in d['graphs']:
+                G = nx.Graph()
+
+                for k, v in graph.items():
+                    k = int(k)
+                    G.add_node(k)
+                    for n in v:
+                        G.add_edge(k, n)
+
+                Gs.append(G)
+
+            try:
+                average_shortest_path_len = nx.average_shortest_path_length(Gs[-1])
+                average_clustering_coefficient = nx.average_clustering(Gs[-1])
+
+                record = {
+                    'n' : d['n'],
+                    'log(n)' : np.log(d['n']),
+                    '1/log(n)' : 1 / np.log(d['n']),
+                    'k' : d['k'],
+                    'beta' : d['beta'],
+                    'temperature' : d['temperature'],
+                    'simulation' : d['simulation'],
+                    '$L$' : average_shortest_path_len,
+                    '$C$' : average_clustering_coefficient,
+                    'Model' : model,
+                    'Environment' : environment
+                }
+
+
+                temperatures.add(d['temperature'])
+                records.append(record)
+
+
+                seen.add((d['n'], d['k'], d['beta']))
+            except:
+                pass
+
+        for n, k, beta in seen:
+            Gs, _ = principle5_network_growth(n, k, beta, 0, method='W-S', model='', environment='', role='')
+
+            average_shortest_path_len = nx.average_shortest_path_length(Gs[-1])
+            average_clustering_coefficient = nx.average_clustering(Gs[-1])
+
+            record = {
+                'n' : n,
+                'log(n)' : np.log(n),
+                '1/log(n)' : 1 / np.log(n),
+                'k' : k,
+                'beta' : beta,
+                'temperature' : 'default',
+                'simulation' : 0,
+                '$L$' : average_shortest_path_len,
+                '$C$' : average_clustering_coefficient,
+                'Model' : 'W-S',
+                'Environment' : 'Baseline'
+            }
+
+            records.append(record)
+
+        df = pd.DataFrame.from_records(records)
+
+        df['Model'] = df['Model'].apply(lambda x: rename_models.get(x, x))
+        df['Environment'] = df['Environment'].apply(lambda x: rename_env.get(x, x))
+
+
+        for temperature in df['temperature'].unique():
+            for model in df['Model'].unique():
+                for environment in df['Environment'].unique():
+                    if model == 'W-S':
+                        continue
+                    query = 'temperature == @temperature & Model == @model & Environment == @environment'
+
+                    if not df.query(query).empty:
+                        regress_result_L = scipy.stats.linregress(df.query(query, inplace=False)['log(n)'], df.query(query, inplace=False)['$L$'])
+                        stars_L = principle5_get_stars(regress_result_L.pvalue, parenthesis=False, num_tests=2)
+                        sns.regplot(data=df.query(query), x='log(n)', y='$L$', ax=ax[0, 0], label=f'{model} {f"({environment})" if environment != "Baseline" else ""} $a$ = {regress_result_L.slope:.2f} ({stars_L})')
+
+                        regress_result_C = scipy.stats.linregress(df.query(query, inplace=False)['1/log(n)'], df.query(query, inplace=False)['$C$'])
+                        stars_C = principle5_get_stars(regress_result_C.pvalue, parenthesis=False, num_tests=2)
+
+                        records_coefficients.append({
+                            'Model' : model,
+                            'Environment' : environment,
+                            'Temperature' : temperature,
+                            'Regression Coefficient ($L \\sim \\log (n)$)' : f'{regress_result_L.slope:.2f} ({stars_L})',
+                            'Regression Coefficient ($C \\sim 1 / \\log (n)$)' : f'{regress_result_C.slope:.2f} ({stars_C})'
+                        })
+
+
+    query = f'Model == "W-S"'
+
+    regress_result_L_WS = scipy.stats.linregress(df.query(query, inplace=False)['log(n)'], df.query(query, inplace=False)['$L$'])
+    stars_L_WS = principle5_get_stars(regress_result_L_WS.pvalue, parenthesis=False, num_tests=2)
+
+    regress_result_C_WS = scipy.stats.linregress(df.query(query, inplace=False)['1/log(n)'], df.query(query, inplace=False)['$C$'])
+    stars_C_WS = principle5_get_stars(regress_result_C_WS.pvalue, parenthesis=False, num_tests=2)
+
+    records_coefficients.append({
+        'Model' : 'W-S',
+        'Environment' : '',
+        'Temperature' : None,
+        'Regression Coefficient ($L \\sim \\log (n)$)' : f'{regress_result_L_WS.slope:.2f} ({stars_L_WS})',
+        'Regression Coefficient ($C \\sim 1 / \\log (n)$)' : f'{regress_result_C_WS.slope:.2f} ({stars_C_WS})'
+    })
+
+    sns.regplot(data=df.query(query), x='log(n)', y='$L$', ax=ax[0, 0], label=f'W-S, $a$ = {regress_result_L_WS.slope:.2f} ({stars_L_WS})')
+
+    ax[0, 0].set_ylabel('$L$')
+    ax[0, 0].set_xlabel('$\\log (n)$')
+
+    # Move legend to the right outside of the plot
+    ax[0, 0].legend(loc='center left', bbox_to_anchor=(1, 0.5))
+
+    sns.despine()
+
+    fig.savefig(f'figures/principle_5/principle_5_multiple{sfx}.pdf', bbox_inches='tight')
+
+    df_coefficients = pd.DataFrame.from_records(records_coefficients)
+
+    df_coefficients.sort_values(['Model', 'Environment', 'Temperature'], inplace=True)
+
+    df_coefficients.to_csv(f'tables/principle_5_multiple{sfx}.csv', index=False)
+    df_coefficients.to_latex(f'tables/principle_5_multiple{sfx}.tex', index=False, escape=False, float_format="%.2f")
+
+def principle5_experiment_outfile(experiment, output_dir):
+    return str(os.path.join(os.fspath(output_dir), f"principle_5_{experiment['name']}.jsonl"))
+
+
+def principle5_build_experiment_record(experiment, output_dir, default_temperatures):
+    environment_role = experiment.get('environment')
+    if environment_role is None:
+        environment = None
+        role = 'friends'
+    else:
+        environment, role = environment_role
+
+    model = experiment['model']
+    params = dict(experiment['parameters'])
+    params['beta'] = experiment['beta']
+    cot = experiment.get('COT', False)
+    return {
+        'experiment': experiment,
+        'name': experiment['name'],
+        'model': model,
+        'outfile': experiment.get('outfile', principle5_experiment_outfile(experiment, output_dir)),
+        'parameters': params,
+        'temperatures': experiment.get('temperatures', default_temperatures),
+        'environment': environment,
+        'role': role,
+        'method': experiment.get('method', 'llm'),
+        'beta': experiment['beta'],
+        'cot': cot,
+        'cot_config': experiment.get('cot_config'),
+        'summary_group': experiment.get('summary_group', 'default'),
+        'metadata': {
+            'experiment_name': experiment['name'],
+            'summary_group': experiment.get('summary_group', 'default'),
+            'model': model,
+            'environment': environment if environment is not None else 'Baseline',
+            'role': role,
+            'cot': cot,
+        },
+    }
+
+
+def principle5_build_cot_calibration_requests(experiment, output_dir, default_temperatures, sample_size=20, seed=0):
+    record = principle5_build_experiment_record(experiment, output_dir, default_temperatures)
+    n = record['parameters']['n_max']
+    k = record['parameters']['k']
+    beta = record['parameters']['beta']
+    temperature = record['temperatures'][0]
+    state = principle5_initialize_growth_state(n, k, beta, temperature, record)
+    rng = random.Random(seed)
+    nodes = list(state['G'].nodes())
+    rng.shuffle(nodes)
+    nodes = nodes[:sample_size]
+
+    requests = []
+    for t in nodes:
+        request = principle5_build_neighbor_request(
+            state['G'],
+            t,
+            state['environment'],
+            state['role'],
+            True,
+            state['model'],
+        )
+        requests.append((t, request))
+    return record, requests
+
+
+def principle5_run_cot_budget_calibration(
+    experiments,
+    output_dir,
+    default_temperatures,
+    default_cot_config,
+    run_experiments=True,
+    calibrate=True,
+    calibration_sample_size=20,
+    calibration_max_new_tokens=65536,
+    calibration_percentile=0.90,
+    calibration_margin=1.5,
+    retry_token_buckets=(8192, 16384, 32768, 65536),
+    calibration_seed=0,
+    calibration_filename='principle_5_cot_budget_calibration.json',
+):
+    return run_cot_budget_calibration(
+        experiments,
+        output_dir,
+        default_temperatures,
+        default_cot_config,
+        build_calibration_requests=principle5_build_cot_calibration_requests,
+        parse_response=principle5_parse_neighbor_response,
+        calibration_filename=calibration_filename,
+        run_experiments=run_experiments,
+        calibrate=calibrate,
+        calibration_sample_size=calibration_sample_size,
+        calibration_max_new_tokens=calibration_max_new_tokens,
+        calibration_percentile=calibration_percentile,
+        calibration_margin=calibration_margin,
+        retry_token_buckets=retry_token_buckets,
+        calibration_seed=calibration_seed,
+    )
+
+
+def principle5_run_configured_experiments(experiments, output_dir, default_temperatures, run_experiments=True, run_analysis=True):
+    supported_models = set(filter_supported_models(sorted({experiment['model'] for experiment in experiments})))
+    outfiles_by_group = collections.defaultdict(list)
+    experiment_records = []
+    experiments_to_analyze = []
+
+    for experiment in experiments:
+        if not experiment.get('run', True):
+            continue
+
+        model = experiment['model']
+        if model not in supported_models:
+            print(f'Skipping {experiment["name"]}: {model} is not supported in this environment.')
+            continue
+
+        record = principle5_build_experiment_record(experiment, output_dir, default_temperatures)
+        experiment_records.append(record)
+
+        if experiment.get('include_in_summary', True):
+            outfiles_by_group[record['summary_group']].append(record['outfile'])
+
+        if experiment.get('analyze_detail', False):
+            experiments_to_analyze.append(record)
+
+    if run_experiments:
+        batch_groups = collections.defaultdict(list)
+        for record in experiment_records:
+            if record['model'].startswith('Qwen/') and record['method'] == 'llm' and record['experiment'].get('batch', True):
+                batch_key = (
+                    record['model'],
+                    record['cot'],
+                    record['beta'],
+                    json.dumps(record.get('cot_config'), sort_keys=True, default=str),
+                )
+                batch_groups[batch_key].append(record)
+                continue
+
+            principle5_run_network_formation_experiment(
+                outfile=record['outfile'],
+                temperatures=record['temperatures'],
+                environment=record['environment'],
+                role=record['role'],
+                method=record['method'],
+                model=record['model'],
+                cot=record['cot'],
+                cot_config=record.get('cot_config'),
+                metadata=record['metadata'],
+                **record['parameters'],
+            )
+
+        for records in batch_groups.values():
+            principle5_run_network_formation_experiments_batch(records)
+
+    if run_analysis:
+        for record in experiments_to_analyze:
+            principle5_analyze_experiments(record['outfile'], suffix=record['name'])
+
+        if outfiles_by_group.get('default'):
+            principle5_get_table(outfiles_by_group['default'])
+        if outfiles_by_group.get('cot'):
+            principle5_get_table(outfiles_by_group['cot'], sfx='_cot')
+
+    return {
+        'supported_models': supported_models,
+        'outfiles_by_group': outfiles_by_group,
+        'experiment_records': experiment_records,
+        'experiments_to_analyze': experiments_to_analyze,
+    }
+
+# --- End Principle 5 small-world utilities ---
+
+# --- Combined real-world network utilities ---
+
+def set_combined_model_runtime_options(font_scale=1.2):
+    sns.set_theme(font_scale=font_scale)
+
+COMBINED_RENAME_MODELS = {
+    'gpt-5-nano' : 'GPT-5 Nano',
+    'gpt-5-mini' : 'GPT-5 Mini',
+    'Qwen-Qwen3.5-4B' : 'Qwen 3.5 4B',
+    'Qwen-Qwen3.5-2B' : 'Qwen 3.5 2B',
+    'Qwen-Qwen3.5-0.8B' : 'Qwen 3.5 0.8B',
+    'gpt-5-nano+link_prediction' : 'GPT-5 Nano',
+    'gpt-5-mini+link_prediction' : 'GPT-5 Mini',
+    'Qwen-Qwen3.5-4B+link_prediction' : 'Qwen 3.5 4B',
+    'Qwen-Qwen3.5-2B+link_prediction' : 'Qwen 3.5 2B',
+    'Qwen-Qwen3.5-0.8B+link_prediction' : 'Qwen 3.5 0.8B',
+    'Qwen-Qwen3.5-4B-nothinking' : 'Qwen 3.5 4B (no thinking)',
+    'Qwen-Qwen3.5-4B-thinking' : 'Qwen 3.5 4B (thinking)',
+    'Qwen-Qwen3.5-4B-nothinking+link_prediction' : 'Qwen 3.5 4B (no thinking)',
+    'Qwen-Qwen3.5-4B-thinking+link_prediction' : 'Qwen 3.5 4B (thinking)',
+}
+
+def combined_network_growth(G0, temperature=None, name='', num_choices=1, method='llm', num_samples=-1, num_nodes_samples=-1, model='gpt-5-mini', sampling_strategy='random', cot=False, cot_config=None):
+    # Set seed
+    random.seed(0)
+    np.random.seed(0)
+
+    # Copy the ground truth graph
+    G = G0.copy()
+
+    Gs = [G.copy()]
+
+    profiles = nx.get_node_attributes(G, 'features')
+
+    if sampling_strategy == 'link_prediction':
+        sk_model = link_prediction.train_link_predictor(G, profiles=profiles, name=name)
+    else:
+        sk_model = None
+
+    # Edges to drop
+    dropped_edges = []
+
+    if num_nodes_samples > 0 and num_nodes_samples < len(G):
+        print(f'Sampling {num_nodes_samples} nodes from {len(G)} nodes')
+        print(G.nodes())
+
+        nodes = random.sample(list(G.nodes()), num_nodes_samples)
+    else:
+        nodes = G.nodes()
+
+
+    # Drop one neighbor for each node
+    for v in nodes:
+        dropped_v_edges = []
+        for _ in range(num_choices):
+            if len(list(G.neighbors(v))) > 0:
+
+                while True:
+                    u = random.choice(list(G.neighbors(v)))
+                    if (v, u) not in dropped_edges:
+                        dropped_v_edges.append((v, u))
+                        G.remove_edge(v, u)
+                        break
+
+        dropped_edges.append(dropped_v_edges)
+
+    Gs = [G.copy()]
+    results = []
+    candidates = []
+
+
+    for i, t in enumerate(nodes):
+
+        if method == 'llm':
+            print('{}/{}'.format(i + 1, len(nodes)))
+            result, candidate = combined_select_neighbor(G, t, profiles, temperature, num_choices=len(dropped_edges[i]), dropped_nodes=[u for (_, u) in dropped_edges[i]], num_samples=num_samples, model=model, sampling_strategy=sampling_strategy, sk_model=sk_model, cot=cot, cot_config=cot_config)
+
+            if result:
+                for r in result:
+                    v = r['name']
+                    r['edge'] = (t, v)
+                    G.add_edge(t, v, similarity=r['similarity'])
+                results.append(result)
+
+            candidates.append(candidate)
+        if method == 'ground_truth':
+            if num_samples > num_choices:
+                choice_set = random.sample([v for v in G.nodes() if v != t], num_samples - num_choices)
+            else:
+                choice_set = [v for v in G.nodes() if v != t]
+
+            new_nodes = [e[1] for e in dropped_edges[i]]
+
+            choice_set = choice_set + new_nodes
+
+
+            result = []
+
+            for v in new_nodes:
+
+                profiles[t]['neighbors'] = list(G.neighbors(t))
+                profiles[v]['neighbors'] = list(G.neighbors(v))
+                profiles[t]['degree'] = len(profiles[t]['neighbors'])
+                profiles[v]['degree'] = len(profiles[v]['neighbors'])
+
+                similarity = combined_measure_similarity(profiles[t], profiles[v])
+                G.add_edge(t, v, similarity=similarity, weight=similarity['common_attributes'])
+
+                result.append({'name' : v, 'similarity' : similarity, 'reason' : method, 'dropped' : True})
+
+            candidate = []
+
+            for v in choice_set:
+                profiles[t]['neighbors'] = list(G.neighbors(t))
+                profiles[v]['neighbors'] = list(G.neighbors(v))
+                profiles[t]['degree'] = len(profiles[t]['neighbors'])
+                profiles[v]['degree'] = len(profiles[v]['neighbors'])
+
+                similarity = combined_measure_similarity(profiles[t], profiles[v])
+                candidate.append({'name' : v, 'similarity' : similarity, 'reason' : method})
+
+            candidates.append(candidate)
+            results.append(result)
+
+            print(f'Node: {t}, Links: {result}, Candidates: {candidate}')
+
+        Gs.append(G.copy())
+
+    return Gs, results, candidates
+
+def combined_fit_dcm(results):
+
+    similarities = [r['similarity'] for result in results for r in result]
+    similarities_df = pd.DataFrame.from_records(similarities)
+    similarities_df = sm.add_constant(similarities_df)
+
+    outcomes = np.array([r['edge'][1] for result in results for r in result])
+
+    print(similarities_df)
+
+    mnl_model = sm.MNLogit(outcomes, similarities_df)
+    mnl_results = mnl_model.fit()
+
+    print(mnl_results.summary())
+
+    return mnl_results
+
+def combined_measure_similarity(profile1, profile2):
+
+    similarity = {
+        'common_attributes' : 0,
+        'common_neighbors' : len(set(profile1['neighbors']) & set(profile2['neighbors'])),
+        'degree' : profile2['degree'],
+    }
+
+    for k in profile1.keys():
+        if k != 'name' and k != 'neighbors' and k in profile2.keys():
+            if isinstance(profile1[k], list):
+                similarity['common_attributes'] += len(set(profile1[k]) & set(profile2[k]))
+            elif profile1[k] == profile2[k]:
+                similarity['common_attributes'] += 1
+
+    return similarity
+
+def combined_build_selection_request(G, t, profiles, num_choices=1, num_samples=-1, dropped_nodes=[], model='gpt-5-mini', sampling_strategy='random', sk_model=None):
+    if num_samples > 0:
+        if sampling_strategy == 'random':
+            choice_set = random.sample([v for v in G.nodes() if v != t and v not in G.neighbors(t)], max(0, num_samples - len(dropped_nodes))) + dropped_nodes
+        elif sampling_strategy == 'pagerank':
+            pagerank_scores = nx.pagerank(G)
+            temp_nodes = [v for v in G.nodes() if v != t and v not in G.neighbors(t)]
+            # pagerank scores to numpy
+            pagerank_scores = np.array([pagerank_scores[v] for v in temp_nodes])
+            choice_set = np.random.choice(temp_nodes, size=min(num_samples - len(dropped_nodes), len(temp_nodes)), replace=False, p=pagerank_scores/np.sum(pagerank_scores)).tolist() + dropped_nodes
+        elif sampling_strategy == 'degree':
+            temp_nodes = [v for v in G.nodes() if v != t and v not in G.neighbors(t)]
+            degree_scores = np.array([G.degree(v) for v in temp_nodes])
+            choice_set = np.random.choice(temp_nodes, size=min(num_samples - len(dropped_nodes), len(temp_nodes)), replace=False, p=degree_scores/np.sum(degree_scores)).tolist() + dropped_nodes
+        elif sampling_strategy == 'link_prediction':
+            choice_set = link_prediction.recommend_friends(sk_model, G, profiles, t, k=num_samples - len(dropped_nodes)) + dropped_nodes
+    else:
+        choice_set = [v for v in G.nodes() if v != t and v not in G.neighbors(t)]
+
+    candidate_profiles = []
+
+    for v in choice_set + [t]:
+        profiles[v]['neighbors'] = list(G.neighbors(v))
+        profiles[v]['degree'] = len(profiles[v]['neighbors'])
+        profiles[v]['name'] = v
+        candidate_profiles.append(profiles[v])
+
+    random.shuffle(candidate_profiles)
+
+    prompt = f"""
+    # Task
+    Your task is to select a set of people to be friends with.
+
+    # Profile
+    Your profile is given below after chevrons:
+    <PROFILE>
+    {json.dumps(profiles[t])}
+    </PROFILE>
+
+    # Candidate Profiles
+    The cadidate profiles to be friends with are given below after chevrons:
+
+    <PROFILES>
+    {json.dumps(candidate_profiles)}
+    </PROFILES>
+
+    # Output
+    The output should be given a list of JSON objects with the following structure
+
+    [
+        {{
+            "name" : name of the person you selected,
+            "reason" : reason for selecting the person
+        }}, ...
+    ]
+
+    # Notes
+    * The output must be a list of JSON objects ranked in the order of preference.
+    * You can make at most {num_choices} selection{'s' if num_choices > 1 else ''}.
+    * If your chat template enables thinking, keep reasoning in the thinking section.
+    * Your output must be contained within the json markdown cue.
+
+    ```json
+    """
+
+    return {'prompt': prompt, 'candidate_profiles': candidate_profiles, 'num_choices': num_choices, 'response_schema': None}
+
+
+def combined_parse_selection_response(ans):
+    for parser in (
+        lambda a: json.loads(a.split('```')[0]),
+        lambda a: json.loads(a.split('```json')[1].split('```')[0]),
+    ):
+        try:
+            results = parser(ans)
+            if isinstance(results, list):
+                return results
+        except Exception:
+            pass
+
+    results = first_json_array(ans)
+    if not isinstance(results, list):
+        raise ValueError('Could not parse a JSON array from the response.')
+    return results
+
+
+def combined_select_neighbor(G, t, profiles, temperature=None, num_choices=1, num_samples=-1, dropped_nodes=[], model='gpt-5-mini', sampling_strategy='random', sk_model=None, cot=False, cot_config=None):
+    request = combined_build_selection_request(G, t, profiles, num_choices=num_choices, num_samples=num_samples, dropped_nodes=dropped_nodes, model=model, sampling_strategy=sampling_strategy, sk_model=sk_model)
+    candidate_profiles = request['candidate_profiles']
+
+    for attempt in range(3 if cot else 1):
+        ans = None
+        try:
+            attempt_cot_config = retry_cot_config(cot_config, attempt) if cot else cot_config
+            if cot and attempt_cot_config and attempt_cot_config != cot_config:
+                print(f'Retrying with max_new_tokens={attempt_cot_config["max_new_tokens"]}')
+            ans = get_response(request['prompt'], temperature=temperature, model=model, cot=cot, cot_config=attempt_cot_config)
+            results = combined_parse_selection_response(ans)
+
+            filtered_results = []
+            for result in results:
+                v = result['name']
+                if v in G.nodes():
+                    result['similarity'] = combined_measure_similarity(profiles[t], profiles[v])
+                    filtered_results.append(result)
+
+                    result['dropped'] = v in dropped_nodes
+
+            print(f'Node: {t}, Links: {filtered_results}')
+
+            candidates = []
+
+            for candidate_profile in candidate_profiles:
+                similarity = combined_measure_similarity(profiles[t], candidate_profile)
+                candidates.append({'name' : candidate_profile['name'], 'similarity' : similarity})
+
+            return filtered_results, candidates
+        except Exception as e:
+            print('error', e)
+
+    return [], []
+
+def combined_run_network_formation_experiment(name, num_simulations, outfile, temperatures=None, method='llm', num_choices=1, num_samples=-1, num_nodes_samples=-1, model='gpt-5-mini', dataloader_fn=None, sampling_strategy='random', cot=False, cot_config=None):
+    networks = dataloader_fn()
+
+    if temperatures is None:
+        temperatures = [None]
+
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    saved_scenarios = set()
+
+    if os.path.exists(outfile):
+        with open(outfile) as f:
+            lines = f.read().splitlines()
+
+        for line in lines:
+            scenario = json.loads(line)
+            saved_scenarios.add((scenario['name'], scenario['ego'], scenario['simulation'], scenario['temperature'], scenario['num_samples'], scenario['num_choices']))
+
+    expected_scenarios = {
+        (name, ego, i, 'default' if temperature is None else temperature, num_samples, num_choices)
+        for ego in networks
+        for i in range(num_simulations)
+        for temperature in temperatures
+    }
+
+    if expected_scenarios.issubset(saved_scenarios):
+        print(f'All simulations already completed for {outfile}. Skipping inference.')
+        return
+
+    print(f'Loaded {len(saved_scenarios)} completed simulations from {outfile}')
+
+    f = open(outfile, 'a+')
+
+    for ego, G0 in networks.items():
+        for i in range(num_simulations):
+            for temperature in temperatures:
+                temperature_label = 'default' if temperature is None else temperature
+                if (name, ego, i, temperature_label, num_samples, num_choices) in saved_scenarios:
+                    print(f'Skipping simulation for name={name}, ego={ego}, i={i}, temperature={temperature_label}, num_choices={num_choices}, num_samples={num_samples}, method={method}')
+                    continue
+                else:
+                    print(f'Running simulation for name={name}, ego={ego}, i={i}, temperature={temperature_label}, num_choices={num_choices}, num_samples={num_samples}, method={method}')
+
+                    Gs, results, candidates = combined_network_growth(G0, temperature=temperature, method=method, name=name, num_choices=num_choices, num_samples=num_samples, num_nodes_samples=num_nodes_samples, model=model, sampling_strategy=sampling_strategy, cot=cot, cot_config=cot_config)
+
+                    temp = {
+                        'name' : name,
+                        'ego' : ego,
+                        'temperature' : temperature_label,
+                        'simulation' : i,
+                        'num_choices' : num_choices,
+                        'num_samples' : num_samples,
+                        'graphs' : [nx.to_dict_of_dicts(G) for G in [Gs[0], Gs[-1]]],
+                        'results' : results,
+                        'candidates' : candidates,
+                        'model' : model,
+                        'sampling_strategy' : sampling_strategy,
+                        'cot' : cot
+                    }
+
+                    f.write(json.dumps(temp) + '\n')
+                    f.flush()
+
+                if method != 'llm':
+                    break
+
+    f.close()
+
+def combined_build_cot_calibration_requests(experiment, output_dir, default_temperatures, sample_size=20, seed=0):
+    dataloader_fn = experiment['dataloader_fn']
+    model = experiment['model']
+    num_samples = experiment.get('num_samples', -1)
+    num_choices = experiment.get('num_choices', 1)
+    num_nodes_samples = experiment.get('num_nodes_samples', -1)
+    sampling_strategy = experiment.get('sampling_strategy', 'random')
+    name = experiment.get('name', 'combined')
+    temperature = experiment.get('temperatures', default_temperatures)[0]
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    networks = dataloader_fn()
+    ego, G0 = next(iter(networks.items()))
+    G = G0.copy()
+    profiles = nx.get_node_attributes(G, 'features')
+
+    if sampling_strategy == 'link_prediction':
+        sk_model = link_prediction.train_link_predictor(G, profiles=profiles, name=name)
+    else:
+        sk_model = None
+
+    if num_nodes_samples > 0 and num_nodes_samples < len(G):
+        nodes = random.sample(list(G.nodes()), num_nodes_samples)
+    else:
+        nodes = list(G.nodes())
+
+    # Mirror combined_network_growth: drop one neighbor per choice for each node.
+    dropped_edges = []
+    for v in nodes:
+        dropped_v_edges = []
+        for _ in range(num_choices):
+            if len(list(G.neighbors(v))) > 0:
+                while True:
+                    u = random.choice(list(G.neighbors(v)))
+                    if (v, u) not in dropped_edges:
+                        dropped_v_edges.append((v, u))
+                        G.remove_edge(v, u)
+                        break
+        dropped_edges.append(dropped_v_edges)
+
+    rng = random.Random(seed)
+    indices = list(range(len(nodes)))
+    rng.shuffle(indices)
+    indices = indices[:sample_size]
+
+    requests = []
+    for i in indices:
+        t = nodes[i]
+        request = combined_build_selection_request(
+            G,
+            t,
+            profiles,
+            num_choices=max(1, len(dropped_edges[i])),
+            dropped_nodes=[u for (_, u) in dropped_edges[i]],
+            num_samples=num_samples,
+            model=model,
+            sampling_strategy=sampling_strategy,
+            sk_model=sk_model,
+        )
+        requests.append((t, request))
+
+    record = {
+        'model': model,
+        'name': name,
+        'temperatures': [temperature],
+        'cot_config': experiment.get('cot_config'),
+    }
+    return record, requests
+
+
+def combined_run_cot_budget_calibration(
+    dataloader_fn,
+    output_dir,
+    model,
+    default_temperatures,
+    default_cot_config,
+    name='combined',
+    num_samples=-1,
+    num_choices=1,
+    num_nodes_samples=-1,
+    sampling_strategy='random',
+    cot_config=None,
+    run_experiments=True,
+    calibrate=True,
+    calibration_sample_size=20,
+    calibration_max_new_tokens=65536,
+    calibration_percentile=0.90,
+    calibration_margin=1.5,
+    retry_token_buckets=(8192, 16384, 32768, 65536),
+    calibration_seed=0,
+    calibration_filename='combined_model_cot_budget_calibration.json',
+):
+    experiments = [{
+        'name': name,
+        'model': model,
+        'COT': True,
+        'dataloader_fn': dataloader_fn,
+        'temperatures': list(default_temperatures),
+        'cot_config': cot_config or default_cot_config,
+        'num_samples': num_samples,
+        'num_choices': num_choices,
+        'num_nodes_samples': num_nodes_samples,
+        'sampling_strategy': sampling_strategy,
+    }]
+    return run_cot_budget_calibration(
+        experiments,
+        output_dir,
+        default_temperatures,
+        default_cot_config,
+        build_calibration_requests=combined_build_cot_calibration_requests,
+        parse_response=lambda ans, request: combined_parse_selection_response(ans),
+        calibration_filename=calibration_filename,
+        run_experiments=run_experiments,
+        calibrate=calibrate,
+        calibration_sample_size=calibration_sample_size,
+        calibration_max_new_tokens=calibration_max_new_tokens,
+        calibration_percentile=calibration_percentile,
+        calibration_margin=calibration_margin,
+        retry_token_buckets=retry_token_buckets,
+        calibration_seed=calibration_seed,
+    )
+
+
+def combined_draw_graph(G, ax, communities=None, palette=None):
+
+    pos = nx.spring_layout(G)
+
+    netgraph.Graph(G, node_layout=pos, node_color='#d35400', node_size=2.5, edge_color='#34495e', edge_width=1, ax=ax)
+
+    ax.set_axis_off()
+
+def combined_generate_regression_table(filename, outfile, bias=True, log_transform=True, exclude_log=[]):
+
+    palette = ['#d35400', '#34495e', '#2980b9', '#e67e22', '#f1c40f', '#7f8c8d', '#27ae60', '#16a085', '#bdc3c7', '#1abc9c', '#2ecc71', '#3498db', '#9b59b6', '#8e44ad', '#ecf0f1']
+
+    with open(filename) as f:
+        lines = f.read().splitlines()
+
+    data = []
+
+    for line in lines:
+        data.append(json.loads(line))
+
+    feature_names = ['degree', 'common_attributes', 'common_neighbors']
+
+    regression_table_df = []
+
+    names = set([d['name'] for d in data])
+
+    for d in data:
+
+        log_likelihoods = {}
+
+        for num_features in range(len(feature_names) + 1):
+            for feature_combination in itertools.combinations(feature_names, num_features):
+                feature_combination = list(feature_combination)
+                theta, standard_errors, log_likelihood, _, probabilities, ame, sdame = dcm.fit_discrete_choice_model((d['results'], d['candidates']), feature_names=feature_combination, bias=bias, log_transform=log_transform, exclude_log=exclude_log, calculate_p_values=True, calculate_average_marginal_effects=True, input_type='results_candidates')
+
+
+                temp = {
+                    'Name' : d["name"],
+                    'Ego' : d["ego"],
+                    'Temperature' : d["temperature"],
+                    'Simulation' : d["simulation"],
+                    'Number of Choices' : d["num_choices"],
+                    'Number of Samples' : d["num_samples"],
+                    'Independent Variable' : feature_combination,
+                    'Coefficients' : theta[:-1].tolist(),
+                    'Standard Errors' : standard_errors[:-1].tolist(),
+                    'Log Likelihood' : log_likelihood,
+                    'Probabilities' : probabilities.tolist() if probabilities is not None else None,
+                    'AME' : ame.tolist() if ame is not None else None,
+                    'SE AME' : sdame.tolist() if sdame is not None else None,
+                }
+
+                log_likelihoods[tuple(sorted(feature_combination))] = log_likelihood
+                p_values = np.array([1 - stats.chi2.cdf(2 * (log_likelihood - log_likelihoods[tuple(sorted(feature_combination[:i] + feature_combination[i + 1:]))]), 1) for i in range(len(feature_combination))])
+
+                print(f'features: {feature_combination}, theta: {theta}, standard_errors: {standard_errors}, p-values: {p_values}, log_likelihood: {log_likelihood}, AME: {ame}, AME (SE): {sdame}')
+
+                temp['P-values'] = p_values.tolist()
+
+
+
+                regression_table_df.append(temp)
+
+    regression_table_df = pd.DataFrame.from_records(regression_table_df)
+
+    regression_table_df.to_excel(outfile)
+
+def combined_compare_models(filenames1, filenames2, bias=True, log_transform=True, exclude_log=[], heatmap=True, suptitle='', supxlabel='', supylabel='', outfile='figures/comparison_between_models.png'):
+
+    palette = ['#d35400', '#34495e', '#2980b9', '#e67e22', '#f1c40f', '#7f8c8d', '#27ae60', '#16a085', '#bdc3c7', '#1abc9c', '#2ecc71', '#3498db', '#9b59b6', '#8e44ad', '#ecf0f1']
+
+    feature_names = ['degree', 'common_attributes', 'common_neighbors']
+
+    records_between_models = []
+    records_effects = []
+
+    for filename1, filename2 in zip(filenames1, filenames2):
+
+        basename1 = filename1.split('+')
+        basename2 = filename2.split('+')
+
+        if len(basename1) == 3:
+            model1 = basename1[-2] + '+' + basename1[-1]
+        elif len(basename1) == 2:
+            model1 = basename1[-1]
+
+        if len(basename2) == 3:
+            model2 = basename2[-2] + '+' + basename2[-1]
+        elif len(basename2) == 2:
+            model2 = basename2[-1]
+
+        # remove file extension from model1
+        model1 = model1.replace('.jsonl', '')
+        model2 = model2.replace('.jsonl', '')
+
+
+        with open(filename1) as f:
+            lines1 = f.read().splitlines()
+
+        with open(filename2) as f:
+            lines2 = f.read().splitlines()
+
+        data1 = []
+
+        for line in lines1:
+            data1.append(json.loads(line))
+
+        data2 = []
+
+        for line in lines2:
+            data2.append(json.loads(line))
+
+
+        for d1, d2 in zip(data1, data2):
+            if d1['name'] != d2['name']:
+                print(f'Skipping {d1["name"]} and {d2["name"]} as they are not the same scenario')
+                continue
+            else:
+                print(f'Comparing {model1} and {model2} on {d1["name"]} at temperature {d1["temperature"]}')
+
+            distance_mean, distance_std, theta_spearman, theta1, theta2, sd1, sd2, ame1, ame2, sdame1, sdame2, p_values_ame1, p_values_ame2 = dcm.combined_compare_models((d1['results'], d1['candidates']), (d2['results'], d2['candidates']), on='Alternative Set', method='tv', bias=bias, feature_names=feature_names, log_transform=log_transform, exclude_log=exclude_log, calculate_p_values=True, calculate_average_marginal_effects=True, input_type='results_candidates')
+
+            records_between_models.append({
+                'Name' : d1['name'].capitalize(),
+                'Model1': COMBINED_RENAME_MODELS.get(model1, model1),
+                'Model2': COMBINED_RENAME_MODELS.get(model2, model2),
+                'TV Distance': distance_mean,
+                'TV Distance Std': distance_std,
+                'Effect Spearman Correlation': theta_spearman,
+                'Theta1': theta1,
+                'Theta2': theta2,
+                'StandardError1': sd1,
+                'StandardError2': sd2,
+                'AME1' : ame1,
+                'AME2' : ame2,
+                'StandardErrorAME1': sdame1,
+                'StandardErrorAME2': sdame2,
+                'P-values AME1': p_values_ame1,
+                'P-values AME2': p_values_ame2
+            })
+
+            for j, feature in enumerate(feature_names):
+
+                stars_1 = '***' if p_values_ame1[j] < 0.001 else '**' if p_values_ame1[j] < 0.01 else '*' if p_values_ame1[j] < 0.05 else ''
+                stars_2 = '***' if p_values_ame2[j] < 0.001 else '**' if p_values_ame2[j] < 0.01 else '*' if p_values_ame2[j] < 0.05 else ''
+
+                ame1_formatted = f"{ame1[j]:.2f}{stars_1} ({sdame1[j]:.2f})"
+                ame2_formatted = f"{ame2[j]:.2f}{stars_2} ({sdame2[j]:.2f})"
+
+                records_effects.append({
+                    'Name' : d1['name'].capitalize(),
+                    'Model': COMBINED_RENAME_MODELS.get(model1, model1),
+                    'Label' : supxlabel,
+                    'Feature': feature,
+                    'AME': ame1_formatted,
+                })
+
+                records_effects.append({
+                    'Name' : d2['name'].capitalize(),
+                    'Model': COMBINED_RENAME_MODELS.get(model2, model2),
+                    'Label' : supylabel,
+                    'Feature': feature,
+                    'AME': ame2_formatted
+                })
+
+    records_between_models_df = pd.DataFrame.from_records(records_between_models)
+    records_effects_df = pd.DataFrame.from_records(records_effects)
+    records_effects_df.drop_duplicates(subset=['Name', 'Model', 'Label', 'Feature'], inplace=True)
+
+    records_between_models_df.to_excel('tables/comparison_between_models.xlsx', index=False)
+
+    names = set(records_between_models_df['Name'].tolist())
+
+    records_effects_df.to_excel('tables/effects_between_models.xlsx', index=False)
+
+    if heatmap:
+        fig, ax = plt.subplots(2, len(names), figsize=(3*len(names), 6), squeeze=False)
+
+        for i, name in enumerate(names):
+
+            ax[0, i].set_title(name.capitalize())
+
+            sns.heatmap(records_between_models_df.query(f'Name == "{name}"').pivot(index='Model1', columns='Model2', values='Effect Spearman Correlation'),
+                annot=True, fmt='.2f', ax=ax[0, i],
+                cbar=(i == len(names) - 1),
+                # cbar_kws={'label': 'Spearman Correlation'},
+                vmin=-1, vmax=1)
+
+            ax[0, i].set_xlabel('')
+            ax[0, i].set_ylabel('')
+
+
+            sns.heatmap(records_between_models_df.query(f'Name == "{name}"').pivot(index='Model1', columns='Model2', values='TV Distance'),
+                annot=True, fmt='.2f', ax=ax[1, i],
+                cbar=(i == len(names) - 1),
+                # cbar_kws={'label': 'TV Distance'},
+                vmin=0, vmax=1)
+
+            ax[1, i].set_xlabel('')
+            ax[1, i].set_ylabel('')
+
+            sns.despine(ax=ax[0, i])
+            sns.despine(ax=ax[1, i])
+
+        ax[0, 0].set_ylabel('Spearman Correlation')
+        ax[1, 0].set_ylabel('TV Distance')
+
+        for i in range(ax.shape[0]-1):
+            for j in range(ax.shape[1]):
+                ax[i, j].set_xticklabels([])
+
+        for j in range(1, ax.shape[1]):
+            for i in range(ax.shape[0]):
+                ax[i, j].set_yticklabels([])
+
+
+    else:
+
+        fig, ax = plt.subplots(1, 2, figsize=(12, 3), squeeze=False)
+
+        sns.barplot(x='Model2', y='Effect Spearman Correlation', hue='Name', data=records_between_models_df, ax=ax[0, 0], palette=palette)
+        ax[0, 0].set_xlabel('')
+        ax[0, 0].set_ylabel('Spearman Correlation')
+        # remove legend
+        ax[0, 0].legend_.remove()
+
+        sns.barplot(x='Model2', y='TV Distance', hue='Name', data=records_between_models_df, ax=ax[0, 1], palette=palette)
+        ax[0, 1].set_xlabel('')
+        ax[0, 1].set_ylabel('TV Distance')
+
+        # move legend to the right
+        ax[0, 1].legend_.remove()
+        ax[0, 1].legend(loc='upper left', bbox_to_anchor=(1, 1), title='Name')
+
+        sns.despine(ax=ax[0, 0])
+        sns.despine(ax=ax[0, 1])
+
+        ax[0, 1].set_ylim(0, 1)
+        ax[0, 0].set_ylim(-1, 1)
+
+    fig.suptitle(suptitle)
+    fig.supxlabel(supxlabel)
+    fig.supylabel(supylabel)
+
+    fig.subplots_adjust(top=0.85)
+    fig.tight_layout()
+    fig.savefig(outfile, bbox_inches='tight')
+
+def combined_pretty_print_regression_table(filenames, outfile, full=False):
+
+    if isinstance(filenames, str):
+        filenames = [filenames]
+
+    regression_table_df = pd.concat([pd.read_excel(filename) for filename in filenames])
+
+    regression_table_df = regression_table_df.query('`Independent Variable` != "[]"')
+
+    table_rows_df = []
+    table_rows_ame_df = []
+
+    ego_row = True
+
+    temperature2idx = {}
+
+
+    for i, row in regression_table_df.iterrows():
+        temp = {}
+        temp_ame = {}
+        if row['Ego'] == -1:
+            ego_row = False
+        else:
+            temp['Ego'] = row['Ego']
+            temp_ame['Ego'] = row['Ego']
+        temp['Temperature'] = str(row['Temperature'])
+        temp_ame['Temperature'] = str(row['Temperature'])
+
+        if row['Temperature'] not in temperature2idx:
+            temperature2idx[row['Temperature']] = len(temperature2idx)
+
+        independent_variables = ast.literal_eval(row['Independent Variable'])
+
+        if (not full and len(independent_variables) ==  3) or full:
+
+            p_values = ast.literal_eval(row['P-values'])
+            coefficients = ast.literal_eval(row['Coefficients'])
+            standard_errors = ast.literal_eval(row['Standard Errors'])
+            ame = ast.literal_eval(row['AME']) if 'AME' in row else None
+            sdame = ast.literal_eval(row['SE AME']) if 'SE AME' in row else None
+
+            for j, feat_name in enumerate(independent_variables):
+                stars = '***' if float(p_values[j]) < 0.001 else '**' if float(p_values[j]) < 0.01 else '*' if float(p_values[j]) < 0.05 else ''
+                temp[f'{feat_name.replace("_", " ").capitalize()}'] = f"{float(coefficients[j]):.2f}{stars} ({float(standard_errors[j]):.1g})"
+                temp_ame[f'{feat_name.replace("_", " ").capitalize()}'] = f"{float(ame[j]):.2f} ({float(sdame[j]):.1g})"
+
+            temp['Log Likelihood'] = f"{row['Log Likelihood']:,.2f}"
+            temp['AIC'] = f'{2 * (len(independent_variables) + 1) - 2 * row["Log Likelihood"]:,.2f}'
+
+            table_rows_df.append(temp)
+            table_rows_ame_df.append(temp_ame)
+
+    table_rows_df = pd.DataFrame.from_records(table_rows_df, columns=['Ego'] if ego_row else [] +  ['Temperature', 'Degree', 'Common attributes', 'Common neighbors', 'Log Likelihood', 'AIC'])
+    table_rows_ame_df = pd.DataFrame.from_records(table_rows_ame_df, columns=['Ego'] if ego_row else [] +  ['Temperature', 'Degree', 'Common attributes', 'Common neighbors'])
+    table_rows_df = table_rows_df.fillna(' ')
+    table_rows_ame_df = table_rows_ame_df.fillna(' ')
+
+    table_rows_df.to_latex(outfile, index=False, escape=True, column_format='lcccccc')
+
+    table_rows_ame_df.to_latex(outfile.replace('.tex', '_ame.tex'), index=False, escape=True, column_format='lcccccc')
+
+def combined_modularity_change(filenames, subgraph=False):
+
+    for filename in filenames:
+
+        with open(filename) as f:
+            lines = f.read().splitlines()
+
+        for line in lines:
+            temp = json.loads(line)
+
+            G0 = nx.from_dict_of_dicts(temp['graphs'][0])
+            G1 = nx.from_dict_of_dicts(temp['graphs'][-1])
+
+            if subgraph:
+                H = nx.difference(G1, G0)
+                H.remove_nodes_from(list(nx.isolates(H)))
+                G0 = nx.subgraph(G0, H.nodes())
+                G1 = nx.subgraph(G1, H.nodes())
+
+            modularities0 = []
+            modularities1 = []
+
+            for seed in range(10):
+                communities0 = nx.community.louvain_communities(G0, seed=seed)
+                modularities0.append(nx.community.modularity(G0, communities0))
+
+                communities1 = nx.community.louvain_communities(G1, seed=seed)
+                modularities1.append(nx.community.modularity(G1, communities1))
+
+
+            t, p = stats.ttest_ind(modularities0, modularities1, equal_var=False, alternative='less')
+
+            print(f'{temp["name"]}, {temp["temperature"]}, T-test: {t}, p-value: {p}')
+
+def combined_lcc(G):
+    Gcc = sorted(nx.connected_components(G), key=len, reverse=True)
+    return G.subgraph(Gcc[0])
+
+def combined_small_worldness(filenames, name, dataloader_fn, subgraph=False):
+
+    networks = dataloader_fn()
+
+    G_initial = networks[list(networks.keys())[0]]
+
+    # LCC subgraph
+    G_initial = combined_lcc(G_initial)
+
+    average_shortest_path_length_initial = nx.average_shortest_path_length(G_initial)
+    clustering_coefficient_initial = nx.average_clustering(G_initial)
+
+    for filename in filenames:
+
+            with open(filename) as f:
+                lines = f.read().splitlines()
+
+            for line in lines:
+                temp = json.loads(line)
+
+                G0 = nx.from_dict_of_dicts(temp['graphs'][0])
+                G1 = nx.from_dict_of_dicts(temp['graphs'][-1])
+                G1 = combined_lcc(G1)
+
+                average_shortest_path_length = nx.average_shortest_path_length(G1)
+                clustering_coefficient = nx.average_clustering(G1)
+
+                average_shortest_path_length_initial_change = (average_shortest_path_length - average_shortest_path_length_initial) / average_shortest_path_length_initial * 100
+                clustering_coefficient_initial_change = (clustering_coefficient - clustering_coefficient_initial) / clustering_coefficient_initial * 100
+
+                print(f'{temp["name"]}, {temp["temperature"]}, Average Shortest Path Length Change: {average_shortest_path_length_initial_change}, Clustering Coefficient Change: {clustering_coefficient_initial_change}')
+
+def combined_graph_statistics_change(filenames, outfile, subgraph=False):
+
+
+    records = []
+
+    for filename in filenames:
+
+            basename1 = filename.split('+')
+
+            if len(basename1) == 3:
+                model = basename1[-2] + '+' + basename1[-1]
+            elif len(basename1) == 2:
+                model = basename1[-1]
+
+
+            # remove file extension from model
+            model = model.replace('.jsonl', '')
+
+            with open(filename) as f:
+                lines = f.read().splitlines()
+
+            for line in lines:
+                temp = json.loads(line)
+
+                name = temp['name']
+
+
+                G0 = nx.from_dict_of_dicts(temp['graphs'][0])
+                G1 = nx.from_dict_of_dicts(temp['graphs'][-1])
+
+                print(f'Analyzing {name} (n = {len(G0)}, m = {len(G0.edges())}) at temperature {temp["temperature"]} using model {model}')
+
+                degrees_G0 = np.array([d for _, d in G0.degree()])
+                degrees_G1 = np.array([d for _, d in G1.degree()])
+
+                # 2-sample KS test
+                ks_statistic, p_value = stats.ks_2samp(degrees_G0, degrees_G1)
+
+                # get sizes of connected components
+                cc_sizes_G0 = [len(c) for c in nx.connected_components(G0)]
+                cc_sizes_G1 = [len(c) for c in nx.connected_components(G1)]
+
+                # 2-sample KS test for connected components sizes
+                ks_statistic_cc, p_value_cc = stats.ks_2samp(cc_sizes_G0, cc_sizes_G1)
+
+                # distribution of singular values
+                if len(G0) < 10000:
+                    svd_G0 = np.linalg.svd(nx.to_numpy_array(G0), compute_uv=False)
+                    svd_G1 = np.linalg.svd(nx.to_numpy_array(G1), compute_uv=False)
+                else:
+                    svd_G0, _ = scipy.sparse.linalg.eigsh(nx.to_scipy_sparse_array(G0), k=10)
+                    svd_G1, _ = scipy.sparse.linalg.eigsh(nx.to_scipy_sparse_array(G1), k=10)
+
+                ks_statistic_svd, p_value_svd = stats.ks_2samp(svd_G0, svd_G1)
+
+                # distributions of local clustering coefficients
+                clustering_coeffs_G0 = np.array(list(nx.clustering(G0).values()))
+                clustering_coeffs_G1 = np.array(list(nx.clustering(G1).values()))
+
+                ks_statistic_clustering, p_value_clustering = stats.ks_2samp(clustering_coeffs_G0, clustering_coeffs_G1)
+
+                m0 = G0.number_of_edges()
+                m1 = G1.number_of_edges()
+
+                number_of_new_edges_added = abs(m1 - m0) / m0 * 100
+
+                print(f'Name: {temp["name"]}, Temperature: {temp["temperature"]}')
+
+                records.append({
+                    'Name' : temp['name'],
+                    'Model' : COMBINED_RENAME_MODELS.get(model, model),
+                    'Temp' : temp['temperature'],
+                    'Degree Distribution (KS)' : ks_statistic,
+                    'Degree Distribution (P-value)' : p_value,
+                    'Sizes of CCs (KS)' : ks_statistic_cc,
+                    'Sizes of CCs (P-value)' : p_value_cc,
+                    'Adjacency Spectrum (KS)' : ks_statistic_svd,
+                    'Adjacency Spectrum (P-value)' : p_value_svd,
+                    'Local Clustering Coefficient (KS)' : ks_statistic_clustering,
+                    'Local Clustering Coefficient (P-value)' : p_value_clustering,
+                    'Number of New Edges Added (%)' : number_of_new_edges_added,
+                })
+
+    records_df = pd.DataFrame.from_records(records)
+
+    with open(outfile, 'w') as f:
+        f.write(records_df.to_latex(index=False, escape=True, column_format='lccccccccccc', float_format='%.1g'))
+
+def combined_measure_relative_increase(filenames):
+
+    for filename in filenames:
+
+        with open(filename) as f:
+            lines = f.read().splitlines()
+
+        data = []
+
+        for line in lines:
+            data.append(json.loads(line))
+
+        for d in data:
+            total, count = 0, 0
+            for results in d["results"]:
+                for result in results:
+                    count += int(result['dropped'])
+                    total += 1
+
+            accuracy = count / total * 100
+            random_guess = 100 / d["num_choices"]
+            relative_increase = (accuracy - random_guess) / random_guess * 100
+
+            print(f'{d["name"]}, {d["temperature"]}, {d["simulation"]}, Relative Increase in Accuracy % = {relative_increase}')
+
+
+# --- End combined real-world network utilities ---
