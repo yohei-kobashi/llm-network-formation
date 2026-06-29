@@ -10,6 +10,7 @@ import collections
 import gc
 import math
 import re
+import hashlib
 import scipy
 import scipy.stats as stats
 import netgraph
@@ -2556,3 +2557,1145 @@ def principle2_run_configured_experiments(experiments, output_dir, default_tempe
     }
 
 # --- End Principle 2 network-formation utilities ---
+
+# --- Principle 1 preferential-attachment utilities ---
+PRINCIPLE1_BASELINE_MODEL = 'Qwen/Qwen3.5-0.8B'
+PRINCIPLE1_MEDIUM_SIZE = 24
+
+
+def set_principle1_runtime_options(baseline_model='Qwen/Qwen3.5-0.8B', medium_size=24):
+    global PRINCIPLE1_BASELINE_MODEL
+    global MEDIUM_SIZE, SMALL_SIZE, BIGGER_SIZE
+    PRINCIPLE1_BASELINE_MODEL = baseline_model
+    MEDIUM_SIZE = medium_size
+    SMALL_SIZE = 0.85 * MEDIUM_SIZE
+    BIGGER_SIZE = 1.5 * MEDIUM_SIZE
+    plt.rc('font', size=SMALL_SIZE)
+    plt.rc('axes', titlesize=SMALL_SIZE)
+    plt.rc('axes', labelsize=MEDIUM_SIZE)
+    plt.rc('xtick', labelsize=SMALL_SIZE)
+    plt.rc('ytick', labelsize=SMALL_SIZE)
+    plt.rc('legend', fontsize=SMALL_SIZE)
+    plt.rc('figure', titlesize=BIGGER_SIZE)
+
+
+def principle1_draw_graph(G, ax, G0=None, use_netgraph=True, nodecolor='#d35400'):
+    if not G0:
+        G0_edges = set()
+    else:
+        G0_edges = set(G0.edges())
+    G_edges = set(G.edges()) - G0_edges
+    if not use_netgraph:
+        pos = nx.spring_layout(G)
+
+        if not G0:
+            nx.draw(G, pos, ax=ax, node_size=10, width=1.5, node_color='#d35400', alpha=0.7, edge_color='#34495e')
+        else:
+
+
+            nx.draw_networkx_edges(G, pos, edgelist=G0_edges, width=1.5, alpha=0.5, edge_color='#34495e', ax=ax)
+            nx.draw_networkx_edges(G, pos, edgelist=G_edges, width=1.5, alpha=1, edge_color='#e67e22', ax=ax)
+
+            nx.draw_networkx_nodes(G, pos, nodelist=list(G.nodes()), node_size=10, node_color=nodecolor, alpha=0.7, ax=ax)
+    else:
+        edge_color = {(u, v) : '#34495e' if (u, v) in G0_edges else '#e67e22'  for (u, v) in G.edges()}
+
+        netgraph.Graph(G, node_layout='spring', node_color=nodecolor, node_size=1.0, edge_color=edge_color, ax=ax)
+
+    ax.set_axis_off()
+
+def principle1_initialize_candidate_state(G, degrees):
+    candidates = []
+    candidate_idx = {}
+
+    for v in G.nodes():
+        if degrees:
+            candidate = {'name': v, 'number_of_friends': G.degree(v)}
+        else:
+            candidate = {'name': v, 'friends': list(G.neighbors(v))}
+
+        candidate_idx[v] = len(candidates)
+        candidates.append(candidate)
+
+    return candidates, candidate_idx
+
+def principle1_update_candidate_state(candidates, candidate_idx, new_node, selected_node, degrees):
+    if selected_node is None:
+        if degrees:
+            candidate = {'name': new_node, 'number_of_friends': 0}
+        else:
+            candidate = {'name': new_node, 'friends': []}
+    else:
+        if degrees:
+            candidates[candidate_idx[selected_node]]['number_of_friends'] += 1
+            candidate = {'name': new_node, 'number_of_friends': 1}
+        else:
+            candidates[candidate_idx[selected_node]]['friends'].append(new_node)
+            candidate = {'name': new_node, 'friends': [selected_node]}
+
+    candidate_idx[new_node] = len(candidates)
+    candidates.append(candidate)
+
+def principle1_build_prompt_candidates(candidates, hash_and_shuffle):
+    if not hash_and_shuffle:
+        return candidates, None
+
+    hash2idx = {}
+    idx2hash = {}
+
+    for candidate in candidates:
+        name = candidate['name']
+        h = str(hashlib.sha256(str(name).encode()).hexdigest())
+        hash2idx[h] = str(name)
+        idx2hash[str(name)] = h
+
+    prompt_candidates = []
+
+    for candidate in candidates:
+        if 'number_of_friends' in candidate:
+            prompt_candidates.append({'name': idx2hash[str(candidate['name'])], 'number_of_friends': candidate['number_of_friends']})
+        else:
+            prompt_candidates.append({'name': idx2hash[str(candidate['name'])], 'friends': [idx2hash[str(n)] for n in candidate['friends']]})
+
+    return prompt_candidates, hash2idx
+
+def principle1_network_growth(T, n0, temperature=None, model='gpt-5-mini', environment=None, role='friends', cot=False, cot_config=None, hash_and_shuffle=False, degrees=True, method='llm'):
+    G = nx.empty_graph(n0)
+
+    # G = nx.erdos_renyi_graph(n0, 0.5)
+
+    candidates, candidate_idx = principle1_initialize_candidate_state(G, degrees)
+    edge_history = []
+    results = []
+
+    for t in range(n0, n0 + T):
+        print(f'Adding node {t}')
+        result = None
+
+        if t > 0:
+            if method == 'llm':
+                result = principle1_select_neighbor(candidates, candidate_idx, temperature, model=model, environment=environment, role=role, cot=cot, cot_config=cot_config, hash_and_shuffle=hash_and_shuffle)
+            elif method == 'ba':
+                result = {'name' : random.choice(list(G.nodes()), weights=[G.degree(n) for n in G.nodes()])}
+
+        G.add_node(t)
+
+        selected_node = None
+        if t > 0 and result:
+            selected_node = result['name']
+            G.add_edge(t, selected_node)
+
+        edge_history.append((t, selected_node))
+        results.append(result)
+        principle1_update_candidate_state(candidates, candidate_idx, t, selected_node, degrees)
+
+    return edge_history, results
+
+def principle1_select_neighbor(candidates, candidate_idx, temperature, model, environment, role, cot, cot_config, hash_and_shuffle):
+    prompt_candidates, hash2idx = principle1_build_prompt_candidates(candidates, hash_and_shuffle)
+    candidate_names = [candidate['name'] for candidate in prompt_candidates]
+    response_schema = build_response_schema(candidate_names)
+    use_structured_output = not (model.startswith('Qwen/') and cot)
+    allowed_names_json = json.dumps(candidate_names, ensure_ascii=False)
+
+    # if len(prompt_candidates) > 200:
+    #     prompt_candidates = random.sample(prompt_candidates, 200)
+
+    if cot:
+        output_format = f"""
+    {{
+        "reason" : reason for selecting the person,
+        "name" : name of the person you selected
+    }}
+        """
+    else:
+        output_format = f"""
+    {{
+        "name" : name of the person you selected,
+        "reason" : reason for selecting the person
+    }}
+        """
+
+    preferential_attachment_prompt = f"""
+    # Task
+    {f'You are in a {environment}.' if environment else ''}Your task is to select a person to be {role} with.
+
+    # Input
+    The input is a list of dictionaries.
+
+    The profiles are given below after chevrons:
+
+    <PROFILES>
+    {json.dumps(prompt_candidates, separators=(',', ':'))}
+    </PROFILES>
+
+    # Output
+    The output should be given in JSON format with the following structure
+
+    {output_format}
+
+    # Notes
+
+    * Return exactly one JSON object.
+    * Do not explain your reasoning outside the JSON object.
+    * Do not write markdown fences.
+    * Do not write any text before or after the JSON object.
+    * The value of "name" must be exactly one of these values: {allowed_names_json}
+    * Do not rename the person.
+    * Do not output labels such as "person 0", "Person 0", or "candidate 0".
+    * The final answer must be exactly one JSON object and must not contain text after the JSON object.
+    """
+
+    request = {
+        'prompt': preferential_attachment_prompt,
+        'response_schema': response_schema if use_structured_output else None,
+        'candidate_names': candidate_names,
+        'hash2idx': hash2idx,
+        'candidate_idx': candidate_idx,
+        'hash_and_shuffle': hash_and_shuffle,
+    }
+
+    for i in range(10):
+        ans = None
+        try:
+            ans = get_response(preferential_attachment_prompt, model, temperature=temperature, response_schema=response_schema if use_structured_output else None, cot=cot, cot_config=cot_config)
+            result = principle1_parse_neighbor_response(ans, request)
+            print('NEW EDGE', result)
+            return result
+        except Exception as e:
+            print_llm_parse_error(e, ans, context=f'principle1_select_neighbor attempt={i + 1}, model={model}')
+
+def principle1_build_neighbor_request(candidates, candidate_idx, environment, role, cot, hash_and_shuffle, model):
+    prompt_candidates, hash2idx = principle1_build_prompt_candidates(candidates, hash_and_shuffle)
+    candidate_names = [candidate['name'] for candidate in prompt_candidates]
+    response_schema = build_response_schema(candidate_names)
+    use_structured_output = not (model.startswith('Qwen/') and cot)
+    allowed_names_json = json.dumps(candidate_names, ensure_ascii=False)
+
+    if cot:
+        output_format = f"""
+    {{
+        "reason" : reason for selecting the person,
+        "name" : name of the person you selected
+    }}
+        """
+    else:
+        output_format = f"""
+    {{
+        "name" : name of the person you selected,
+        "reason" : reason for selecting the person
+    }}
+        """
+
+    prompt = f"""
+    # Task
+    {f'You are in a {environment}.' if environment else ''}Your task is to select a person to be {role} with.
+
+    # Input
+    The input is a list of dictionaries.
+
+    The profiles are given below after chevrons:
+
+    <PROFILES>
+    {json.dumps(prompt_candidates, separators=(',', ':'))}
+    </PROFILES>
+
+    # Output
+    The output should be given in JSON format with the following structure
+
+    {output_format}
+
+    # Notes
+
+    * Return exactly one JSON object.
+    * Do not explain your reasoning outside the JSON object.
+    * Do not write markdown fences.
+    * Do not write any text before or after the JSON object.
+    * The value of "name" must be exactly one of these values: {allowed_names_json}
+    * Do not rename the person.
+    * Do not output labels such as "person 0", "Person 0", or "candidate 0".
+    * The final answer must be exactly one JSON object and must not contain text after the JSON object.
+    """
+
+    return {
+        'prompt': prompt,
+        'response_schema': response_schema if use_structured_output else None,
+        'candidate_names': candidate_names,
+        'hash2idx': hash2idx,
+        'candidate_idx': candidate_idx,
+        'hash_and_shuffle': hash_and_shuffle,
+    }
+
+def principle1_parse_neighbor_response(ans, request):
+    candidate_names = request['candidate_names']
+    result = first_json_object(ans)
+    recovered = False
+    if not isinstance(result, dict) or 'name' not in result:
+        result = recover_name_from_malformed_response(ans, set(candidate_names))
+        recovered = True
+
+    normalized_name = normalize_name(result['name'], set(candidate_names))
+    if normalized_name is None:
+        raise ValueError(f"Invalid candidate name: {result['name']}")
+    result['name'] = normalized_name
+    if recovered:
+        result.setdefault('reason', 'Recovered from malformed JSON response')
+        result['parse_recovered'] = True
+
+    if not request['hash_and_shuffle'] and result['name'] in request['candidate_idx']:
+        return result
+    if request['hash_and_shuffle'] and result['name'] in request['hash2idx']:
+        result['name'] = int(request['hash2idx'][result['name']]) if request['hash2idx'][result['name']].isdigit() else request['hash2idx'][result['name']]
+        return result
+
+    raise ValueError(f"Invalid candidate name: {result['name']}")
+
+def principle1_initialize_growth_state(n, n0, temperature, experiment_record):
+    G = nx.empty_graph(n0)
+    candidates, candidate_idx = principle1_initialize_candidate_state(G, experiment_record['degrees'])
+    return {
+        **experiment_record,
+        'n': n,
+        'n0': n0,
+        'temperature': temperature,
+        'temperature_label': 'default' if temperature is None else temperature,
+        'G': G,
+        'candidates': candidates,
+        'candidate_idx': candidate_idx,
+        'edge_history': [],
+        'reasons': [],
+        't': n0,
+        'end_t': n0 + n,
+    }
+
+def principle1_advance_growth_state(state, result):
+    t = state['t']
+    G = state['G']
+    G.add_node(t)
+
+    selected_node = None
+    if result:
+        selected_node = result['name']
+        G.add_edge(t, selected_node)
+
+    state['edge_history'].append((t, selected_node))
+    state['reasons'].append(result)
+    principle1_update_candidate_state(state['candidates'], state['candidate_idx'], t, selected_node, state['degrees'])
+    state['t'] += 1
+
+def principle1_write_growth_state(state):
+    temp = {
+        'n' : state['n'],
+        'n0' : state['n0'],
+        'temperature' : state['temperature_label'],
+        'simulation' : state['simulation'],
+        'edge_history' : state['edge_history'],
+        'reasons' : state['reasons'],
+        'model' : state['model'],
+        'environment' : state['environment'] if state['environment'] is not None else 'Baseline',
+        'role' : state['role'],
+        'degrees_experiment' : state['degrees'],
+        'cot' : state['cot'],
+    }
+    if state.get('metadata'):
+        temp.update(state['metadata'])
+
+    with open(state['outfile'], 'a+') as f:
+        f.write(json.dumps(temp) + '\n')
+        f.flush()
+
+def principle1_pending_growth_states_for_experiment(experiment_record):
+    parameters = experiment_record['parameters']
+    temperatures = experiment_record['temperatures']
+    outfile = experiment_record['outfile']
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    saved_scenarios = set()
+    if os.path.exists(outfile):
+        with open(outfile) as f:
+            lines = f.read().splitlines()
+        for line in lines:
+            scenario = json.loads(line)
+            saved_scenarios.add((scenario['n'], scenario['simulation'], scenario['temperature']))
+
+    print(f'Loaded {len(saved_scenarios)} completed simulations from {outfile}')
+    states = []
+    n_min = parameters['n_min']
+    n_max = parameters['n_max']
+    n_step = parameters['n_step']
+    num_simulations = parameters['num_simulations']
+    n0 = 1
+    for n in range(n_min, n_max + 1, n_step):
+        for i in range(num_simulations):
+            for temperature in temperatures:
+                temperature_label = 'default' if temperature is None else temperature
+                if (n, i, temperature_label) in saved_scenarios:
+                    print(f'Skipping simulation for n={n}, i={i}, temperature={temperature_label}')
+                    continue
+                print(f'Queueing simulation for n={n}, i={i}, temperature={temperature_label}, outfile={outfile}')
+                state = principle1_initialize_growth_state(n, n0, temperature, experiment_record)
+                state['simulation'] = i
+                states.append(state)
+    return states
+
+def principle1_run_network_formation_experiments_batch(experiment_records):
+    if not experiment_records:
+        return
+
+    model = experiment_records[0]['model']
+    cot = experiment_records[0]['cot']
+    cot_config = experiment_records[0].get('cot_config')
+    active_states = []
+    for experiment_record in experiment_records:
+        active_states.extend(principle1_pending_growth_states_for_experiment(experiment_record))
+
+    if not active_states:
+        print(f'All batched simulations already completed for {model}. Skipping inference.')
+        return
+
+    print(f'Running {len(active_states)} batched simulations for {model}, cot={cot}')
+    while active_states:
+        requests_by_temperature = collections.defaultdict(list)
+        for state in active_states:
+            print(f'Adding node {state["t"]} for {state["metadata"]["experiment_name"]}, simulation={state["simulation"]}')
+            request = principle1_build_neighbor_request(
+                state['candidates'],
+                state['candidate_idx'],
+                state['environment'],
+                state['role'],
+                state['cot'],
+                state['hash_and_shuffle'],
+                state['model'],
+            )
+            requests_by_temperature[state['temperature']].append((state, request))
+
+        results_by_state_id = {}
+        for temperature, batch_items in requests_by_temperature.items():
+            remaining = list(batch_items)
+            for attempt in range(10):
+                if not remaining:
+                    break
+
+                prompts = [request['prompt'] for _, request in remaining]
+                response_schemas = [request['response_schema'] for _, request in remaining]
+                answers = get_responses(
+                    prompts,
+                    model,
+                    temperature=temperature,
+                    response_schemas=response_schemas,
+                    cot=cot,
+                    cot_config=cot_config,
+                )
+
+                next_remaining = []
+                for (state, request), ans in zip(remaining, answers):
+                    try:
+                        result = principle1_parse_neighbor_response(ans, request)
+                        print('NEW EDGE', result)
+                        results_by_state_id[id(state)] = result
+                    except Exception as e:
+                        print_llm_parse_error(
+                            e,
+                            ans,
+                            context=(
+                                f'batch attempt={attempt + 1}, '
+                                f'experiment={state["metadata"]["experiment_name"]}, '
+                                f'simulation={state["simulation"]}, '
+                                f'node={state["t"]}, '
+                                f'model={state["model"]}, '
+                                f'temperature={state["temperature_label"]}'
+                            ),
+                        )
+                        next_remaining.append((state, request))
+                remaining = next_remaining
+
+            for state, _ in remaining:
+                results_by_state_id[id(state)] = None
+
+        next_active_states = []
+        for state in active_states:
+            principle1_advance_growth_state(state, results_by_state_id.get(id(state)))
+            if state['t'] >= state['end_t']:
+                principle1_write_growth_state(state)
+            else:
+                next_active_states.append(state)
+        active_states = next_active_states
+
+def principle1_run_network_formation_experiment(n_min, n_max, n_step, num_simulations, outfile, temperatures=None, environment=None, role='friends', degrees=True, model='gpt-5-mini', cot=False, cot_config=None, hash_and_shuffle=False, metadata=None):
+
+    if temperatures is None:
+        temperatures = [None]
+
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    saved_scenarios = set()
+
+    if os.path.exists(outfile):
+        with open(outfile) as f:
+            lines = f.read().splitlines()
+
+        for line in lines:
+            scenario = json.loads(line)
+            saved_scenarios.add((scenario['n'], scenario['simulation'], scenario['temperature']))
+
+    expected_scenarios = {
+        (n, i, 'default' if temperature is None else temperature)
+        for n in range(n_min, n_max + 1, n_step)
+        for i in range(num_simulations)
+        for temperature in temperatures
+    }
+
+    if expected_scenarios.issubset(saved_scenarios):
+        print(f'All simulations already completed for {outfile}. Skipping inference.')
+        return
+
+    print(f'Loaded {len(saved_scenarios)} completed simulations from {outfile}')
+
+    f = open(outfile, 'a+')
+
+    for n in range(n_min, n_max + 1, n_step):
+        for i in range(num_simulations):
+            for temperature in temperatures:
+                temperature_label = 'default' if temperature is None else temperature
+                if (n, i, temperature_label) in saved_scenarios:
+                    print(f'Skipping simulation for n={n}, i={i}, temperature={temperature_label}')
+                    continue
+                else:
+                    print(f'Running simulation for n={n}, i={i}, temperature={temperature_label}')
+                    n0 = 1
+                    edge_history, reasons = principle1_network_growth(n, n0, temperature=temperature, degrees=degrees, model=model, environment=environment, role=role, cot=cot, cot_config=cot_config, hash_and_shuffle=hash_and_shuffle)
+
+                    temp = {
+                        'n' : n,
+                        'n0' : n0,
+                        'temperature' : temperature_label,
+                        'simulation' : i,
+                        'edge_history' : edge_history,
+                        'reasons' : reasons,
+                        'model' : model,
+                        'environment' : environment if environment is not None else 'Baseline',
+                        'role' : role,
+                        'degrees_experiment' : degrees,
+                        'cot' : cot,
+                    }
+                    if metadata:
+                        temp.update(metadata)
+
+                    f.write(json.dumps(temp) + '\n')
+                    f.flush()
+
+    f.close()
+
+def principle1_reconstruct_graphs(d):
+    if 'graphs' in d:
+        Gs = []
+        for graph in d['graphs']:
+            G = nx.Graph()
+
+            for k, v in graph.items():
+                k = int(k)
+                G.add_node(k)
+                for n in v:
+                    G.add_edge(k, n)
+
+            G.remove_nodes_from(list(nx.isolates(G)))
+            Gs.append(G)
+
+        return Gs
+
+    G = nx.empty_graph(d['n0'])
+    Gs = []
+
+    for t, selected_node in d['edge_history']:
+        G.add_node(t)
+        if selected_node is not None:
+            G.add_edge(t, selected_node)
+
+        H = G.copy()
+        H.remove_nodes_from(list(nx.isolates(H)))
+        Gs.append(H)
+
+    return Gs
+
+def principle1_analyze_experiments(filename, dgr=True):
+    os.makedirs('figures/principle_1', exist_ok=True)
+
+    suffix = os.path.split(os.path.splitext(filename)[0])[-1]
+
+    palette = ['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9']
+
+    with open(filename) as f:
+        lines = f.read().splitlines()
+
+    data = []
+
+    for line in lines:
+        data.append(json.loads(line))
+
+    degree_freqs = collections.defaultdict(list)
+    dergee_freqs_barabasi_albert = collections.defaultdict(list)
+
+    wasserstein_distances = collections.defaultdict(list)
+    ks_statistics = collections.defaultdict(list)
+    gammas = collections.defaultdict(list)
+    gammas_barabasi_albert = collections.defaultdict(list)
+    sigmas = collections.defaultdict(list)
+    sigmas_barabasi_albert = collections.defaultdict(list)
+    ks_powerlaw = collections.defaultdict(list)
+    confidence_ks_intervals = collections.defaultdict(list)
+    pwl_fits = collections.defaultdict(list)
+    pwl_fits_barabasi_albert = collections.defaultdict(list)
+
+    final_graphs = collections.defaultdict(list)
+
+    for d in data:
+        Gs = principle1_reconstruct_graphs(d)
+
+        final_graphs[d['n'], d['temperature']].append((Gs[-1].copy(), Gs[0].copy()))
+
+        fig, ax = plt.subplots(1, 4, figsize=(20, 5))
+        fig_barabasi_albert, ax_barabasi_albert = plt.subplots(1, 2, figsize=(10, 5))
+
+        # fig.suptitle(f'Graph created based on Principle 1 with $n = {d["n"]}$, $n_0 = {d["n0"]}$, temperature = {d["temperature"]}')
+
+        G_barabasi_albert = nx.barabasi_albert_graph(n=d['n'], m=1, seed=1)
+
+        for i, t in enumerate([len(Gs) // 3, 2 * len(Gs) // 3, len(Gs) - 1]):
+            G = Gs[t]
+            ax[i].set_title(f'$t = {t}$')
+            if len(Gs[0]) > 2:
+                principle1_draw_graph(G, ax=ax[i], G0=Gs[0])
+            else:
+                principle1_draw_graph(G, ax=ax[i])
+
+        principle1_draw_graph(G_barabasi_albert, ax=ax_barabasi_albert[0], nodecolor='#3498db')
+
+
+        degrees = [G.degree(n) for n in G.nodes()]
+        degrees_barabasi_albert = [G_barabasi_albert.degree(n) for n in G_barabasi_albert.nodes()]
+
+        powerlaw_fit = pwl.Fit(degrees, discrete=True)
+
+        print(f'Temperature {d["temperature"]}: xmin: {powerlaw_fit.xmin}, alpha: {powerlaw_fit.alpha}, sigma: {powerlaw_fit.sigma}')
+
+        powerlaw_fit_barabasi_albert = pwl.Fit(degrees_barabasi_albert, discrete=True)
+
+        wasserstein_distances[d['n'], d['temperature']].append(stats.wasserstein_distance(degrees, degrees_barabasi_albert))
+        gammas[d['n'], d['temperature']].append(powerlaw_fit.alpha)
+        sigmas[d['n'], d['temperature']].append(powerlaw_fit.sigma)
+
+        gammas_barabasi_albert[d['n'], d['temperature']].append(powerlaw_fit_barabasi_albert.alpha)
+        sigmas_barabasi_albert[d['n'], d['temperature']].append(powerlaw_fit_barabasi_albert.sigma)
+
+        ks_stat_powerlaw = getattr(powerlaw_fit.power_law, 'D', None)
+        if ks_stat_powerlaw is None:
+            ks_stat_powerlaw = powerlaw_fit.power_law.KS(degrees)
+        ks_powerlaw[d['n'], d['temperature']].append(ks_stat_powerlaw)
+
+        ax[-1].set_title('Degree distribution')
+        ax[-1].spines[['right', 'top']].set_visible(False)
+
+        ax_barabasi_albert[-1].set_title('Degree distribution')
+
+        powerlaw_fit.plot_ccdf(linewidth=3, ax=ax[-1], color='#e74c3c', label='LLM (Empirical)')
+        powerlaw_fit_barabasi_albert.plot_ccdf(linewidth=3, ax=ax[-1], color='#3498db', label='BA (Empirical)')
+
+        powerlaw_fit_barabasi_albert.plot_ccdf(linewidth=3, ax=ax_barabasi_albert[-1], color='#3498db', label='BA (Empirical)')
+
+        powerlaw_fit.power_law.plot_ccdf(ax=ax[-1], color='#e74c3c', linestyle='--', label='LLM (Power law fit)')
+        powerlaw_fit_barabasi_albert.power_law.plot_ccdf(ax=ax[-1], color='#3498db', linestyle='--', label='BA (Power law fit)')
+
+        powerlaw_fit_barabasi_albert.power_law.plot_ccdf(ax=ax_barabasi_albert[-1], color='#3498db', linestyle='--', label='BA (Power law fit)')
+
+        print(f'BA powerlaw fit gamma: {powerlaw_fit_barabasi_albert.power_law.alpha:.2f} +- {powerlaw_fit_barabasi_albert.power_law.sigma:.2f}')
+
+        pwl_fits[d['n'], d['temperature']].append(powerlaw_fit)
+        pwl_fits_barabasi_albert[d['n'], d['temperature']].append(powerlaw_fit_barabasi_albert)
+
+        print(f'Temperature: {d["temperature"]}, KS Test with BA (empirical): {stats.ks_2samp(degrees, degrees_barabasi_albert)}')
+        print()
+
+        # Exports to perform bootstrap hypothesis test in R using the poweRlaw package
+        df = pd.DataFrame(degrees)
+        df.to_csv(f'degrees{"_neighbors" if not dgr else ""}_{d["n"]}_{d["simulation"]}_{d["temperature"]}.txt', header=None, index=False)
+
+        ax[-1].legend()
+        ax[-1].set_xlabel('Degree')
+        ax[-1].set_ylabel('CCDF')
+        ax[-1].spines[['right', 'top']].set_visible(False)
+
+
+        ax_barabasi_albert[-1].legend()
+        ax_barabasi_albert[-1].set_xlabel('Degree')
+        ax_barabasi_albert[-1].set_ylabel('CCDF')
+
+        fig.tight_layout()
+
+        fig.suptitle(f'Temperature = {d["temperature"]}', y=1.05)
+        fig_barabasi_albert.suptitle('BA Model', y=1.05)
+
+        fig.savefig(f'figures/principle_1/{suffix}_{d["n"]}_{d["simulation"]}_{d["temperature"]}{"_neighbors" if not dgr else ""}.pdf', bbox_inches='tight')
+        fig_barabasi_albert.savefig(f'figures/principle_1/{suffix}_{d["n"]}_{d["simulation"]}_{d["temperature"]}_barabasi_albert{"_neighbors" if not dgr else ""}.pdf', bbox_inches='tight')
+
+    fig, ax = plt.subplots(1, 1 + len(final_graphs), figsize=(5 * (1 + len(final_graphs)), 5), squeeze=False, gridspec_kw={'width_ratios': [1] * (1 + len(final_graphs))})
+    # fig.suptitle(f'Graphs created based on Principle 1 with $n = {d["n"]}$, $n_0={d["n0"]}$')
+
+    for i, k in enumerate(sorted(final_graphs.keys())):
+        G, G0 = final_graphs[k][0]
+
+        if len(G0) > 2:
+            principle1_draw_graph(G, ax[0, i], G0=G0, nodecolor=palette[i])
+        else:
+            principle1_draw_graph(G, ax[0, i], nodecolor=palette[i])
+        ax[0, i].set_title(f'Temperature = {k[-1]}')
+
+
+    for i, k in enumerate(sorted(pwl_fits.keys())):
+        powerlaw_fit = pwl_fits[k][0]
+        powerlaw_fit.plot_ccdf(linewidth=3, ax=ax[0, -1], color=palette[i], label=str(k[-1]))
+        powerlaw_fit.power_law.plot_ccdf(ax=ax[0, -1], color=palette[i], linestyle='--')
+
+
+    for i, k in enumerate(sorted(pwl_fits.keys())):
+
+        powerlaw_fit_barabasi_albert = pwl_fits_barabasi_albert[k][0]
+
+        if i == 0:
+            powerlaw_fit_barabasi_albert.plot_ccdf(linewidth=3, ax=ax[0, -1], color='#7f8c8d', label='BA')
+            powerlaw_fit_barabasi_albert.power_law.plot_ccdf(ax=ax[0, -1], color='#7f8c8d', linestyle='--')
+
+
+    ax[0, -1].legend()
+    ax[0, -1].set_xlabel('Degree')
+    ax[0, -1].set_ylabel('Complementary CDF')
+    ax[0, -1].spines[['right', 'top']].set_visible(False)
+
+    fig.tight_layout()
+
+    fig.savefig(f'figures/principle_1/{suffix}_final_graphs{"_neighbors" if not dgr else ""}.pdf')
+
+def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
+    os.makedirs('figures', exist_ok=True)
+    os.makedirs('tables', exist_ok=True)
+
+    records = []
+
+    for filename in filenames:
+        suffix = os.path.split(os.path.splitext(filename)[0])[-1]
+        suffix = suffix.split('+')
+
+        with open(filename) as f:
+            lines = f.read().splitlines()
+
+        data = []
+
+        for line in lines:
+            data.append(json.loads(line))
+
+        for d in data:
+            Gs = principle1_reconstruct_graphs(d)
+
+            G_barabasi_albert = nx.barabasi_albert_graph(n=d['n'], m=1, seed=1)
+
+            G = Gs[-1]
+
+            degrees = np.array([G.degree(n) for n in G.nodes()])
+            degrees_barabasi_albert = np.array([G_barabasi_albert.degree(n) for n in G_barabasi_albert.nodes()])
+
+
+            powerlaw_fit = pwl.Fit(degrees, discrete=True)
+
+            wasserstein_distance = stats.wasserstein_distance(degrees, degrees_barabasi_albert)
+            gamma = powerlaw_fit.alpha
+            sigma = powerlaw_fit.sigma
+
+            if 'model' in d:
+                model = str(d['model']).replace('/', '-')
+                if d.get('cot') and not model.endswith('_cot'):
+                    model = f'{model}_cot'
+                environment = d.get('environment', 'Baseline')
+                if environment is None:
+                    environment = 'Baseline'
+                if d.get('cot') and environment != 'Baseline' and not str(environment).endswith('_cot'):
+                    environment = f'{environment}_cot'
+            elif len(suffix) == 3:
+                model = suffix[-2]
+                environment = suffix[-1]
+            elif len(suffix) == 2:
+                model = suffix[-1]
+                environment = 'Baseline'
+            else:
+                environment = 'Baseline'
+
+            ks_stats = stats.ks_2samp(degrees, degrees_barabasi_albert)
+
+            if ks_stats[1] < 0.001:
+                stars = '***'
+            elif ks_stats[1] < 0.01:
+                stars = '**'
+            elif ks_stats[1] < 0.05:
+                stars = '*'
+            else:
+                stars = 'p = {:.3f}'.format(ks_stats[1])
+
+
+            # top k plot info
+
+            degrees = np.sort(degrees)[::-1]
+
+            # insert 0 at the beginning
+            degrees = np.insert(degrees, 0, 0)
+            degrees_cumsum = np.cumsum(degrees)
+            probability_of_topk_yaxis = degrees_cumsum / degrees_cumsum[-1]
+
+            probability_of_topk_xaxis = np.arange(len(degrees)) / len(degrees)
+
+            record = {
+                'Model' : model,
+                'Environment' : environment,
+                'Temperature' : d['temperature'],
+                '$\\hat \\gamma$' : gamma,
+                '$\\sigma$' : sigma,
+                'KS Test' : f'{ks_stats[0]:.3f} ({stars})',
+                'Probability of Connecting to Top-$k$' : probability_of_topk_yaxis,
+                'Top-$k$' : probability_of_topk_xaxis
+            }
+
+            records.append(record)
+
+    G_barabasi_albert = nx.barabasi_albert_graph(n=d['n'], m=1, seed=1)
+    degrees_barabasi_albert = [G_barabasi_albert.degree(n) for n in G_barabasi_albert.nodes()]
+    powerlaw_fit = pwl.Fit(degrees_barabasi_albert, discrete=True)
+    gamma = powerlaw_fit.alpha
+    sigma = powerlaw_fit.sigma
+
+    record = {
+        'Model' : 'Barabasi-Albert',
+        'Environment' : 'Baseline',
+        'Temperature' : None,
+        '$\\hat \\gamma$' : gamma,
+        '$\\sigma$' : sigma,
+        'KS Test' : None
+    }
+
+    records.append(record)
+
+    df = pd.DataFrame.from_records(records)
+
+
+    df.to_csv('tables/exponents.csv', index=False)
+    df.to_latex('tables/exponents.tex', index=False, escape=False, float_format="%.3f")
+
+    rename_models = {
+        'gpt-5-nano' : 'GPT-5 Nano',
+        'gpt-5-mini' : 'GPT-5 Mini',
+        'Qwen-Qwen3.5-4B' : 'Qwen 3.5 4B',
+        'Qwen-Qwen3.5-2B' : 'Qwen 3.5 2B',
+        'Qwen-Qwen3.5-0.8B' : 'Qwen 3.5 0.8B',
+        'gpt-5-nano_cot' : 'GPT-5 Nano',
+        'gpt-5-mini_cot' : 'GPT-5 Mini',
+        'Qwen-Qwen3.5-4B_cot' : 'Qwen 3.5 4B',
+        'Qwen-Qwen3.5-2B_cot' : 'Qwen 3.5 2B',
+        'Qwen-Qwen3.5-0.8B_cot' : 'Qwen 3.5 0.8B',
+    }
+
+    rename_environment = {
+        'school' : 'School',
+        'community' : 'Community',
+        'work' : 'Work',
+        'school_cot' : 'School',
+        'community_cot' : 'Community',
+        'work_cot' : 'Work'
+    }
+
+
+    df['Model'] = df['Model'].apply(lambda x: rename_models.get(x, x))
+    df['Environment'] = df['Environment'].apply(lambda x: rename_environment.get(x, x))
+
+
+    baseline_model_key = PRINCIPLE1_BASELINE_MODEL.replace('/', '-')
+    baseline_model = rename_models.get(baseline_model_key, baseline_model_key)
+    default_temperature = df[df['Temperature'].notna()]['Temperature'].iloc[0]
+
+    df_model = df.query('Environment == "Baseline" and Temperature == @default_temperature')
+    df_model = df_model[df_model['Model'] != 'Barabasi-Albert']
+
+    df_environment = df.query('Model == @baseline_model and Temperature == @default_temperature')
+    df_temperature = df.query('Model == @baseline_model and Environment == "Baseline"')
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+    sc_model = sns.barplot(data=df_model, y='$\\hat \\gamma$', x='Model', ax=ax[0], palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'])
+    sc_temperature = sns.barplot(data=df_temperature, y='$\\hat \\gamma$', x='Temperature', ax=ax[1], palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'])
+    sc_environment = sns.barplot(data=df_environment, y='$\\hat \\gamma$', x='Environment', ax=ax[2], palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'])
+
+
+
+
+    sc_model.set_xticklabels(sc_model.get_xticklabels(), rotation=90)
+    sc_temperature.set_xticklabels(sc_temperature.get_xticklabels(), rotation=90)
+    sc_environment.set_xticklabels(sc_environment.get_xticklabels(), rotation=90)
+
+    ax[0].errorbar(df_model['Model'], df_model['$\\hat \\gamma$'], yerr=df_model['$\\sigma$'], color='black', linestyle='', capsize=10, alpha=0.5)
+    ax[1].errorbar(df_temperature['Temperature'].astype(str), df_temperature['$\\hat \\gamma$'], yerr=df_temperature['$\\sigma$'], color='black', linestyle='', capsize=10, alpha=0.5)
+    ax[2].errorbar(df_environment['Environment'], df_environment['$\\hat \\gamma$'], yerr=df_environment['$\\sigma$'], color='black', linestyle='', capsize=10, alpha=0.5)
+
+
+
+    gamma_ba = df[df['Model'] == 'Barabasi-Albert']['$\\hat \\gamma$'].values[0]
+    sigma_ba = df[df['Model'] == 'Barabasi-Albert']['$\\sigma$'].values[0]
+
+    # draw baraasi-albert line
+    ax[0].axhline(y=gamma_ba, color='#c0392b', linestyle='--', label='BA (Sample)', linewidth=3)
+    ax[1].axhline(y=gamma_ba, color='#c0392b', linestyle='--', label='BA (Sample)', linewidth=3)
+    ax[2].axhline(y=gamma_ba, color='#c0392b', linestyle='--', label='BA (Sample)', linewidth=3)
+
+    ax[0].axhline(y=3, color='#34495e', linestyle=':', label='BA (Theoretical)', linewidth=3)
+    ax[1].axhline(y=3, color='#34495e', linestyle=':', label='BA (Theoretical)', linewidth=3)
+    ax[2].axhline(y=3, color='#34495e', linestyle=':', label='BA (Theoretical)', linewidth=3)
+
+    ax[0].legend(fontsize=0.7*SMALL_SIZE)
+
+    ax[0].set_ylim(1, 5)
+    ax[1].set_ylim(1, 5)
+    ax[2].set_ylim(1, 5)
+
+    ax[1].set_ylabel('')
+    ax[2].set_ylabel('')
+
+    ax[0].set_xlabel('')
+    ax[1].set_xlabel('')
+    ax[2].set_xlabel('')
+
+    ax[0].set_title('Model')
+    ax[1].set_title('Temperature')
+    ax[2].set_title('Environment')
+
+
+    ax[1].get_yaxis().set_visible(False)
+    ax[2].get_yaxis().set_visible(False)
+
+    ax[0].spines[['right', 'top']].set_visible(False)
+    ax[1].spines[['right', 'top']].set_visible(False)
+    ax[2].spines[['right', 'top']].set_visible(False)
+
+    # fig.tight_layout()
+
+    fig.savefig(f'figures/exponents{sfx}.pdf', bbox_inches='tight')
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+    # plot probability of connecting to top-k
+
+    palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9']
+
+
+
+    breakpoints_arr = [('top', np.array([0.01, 0.015, 0.02, 0.025])), ('all', np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99]))]
+
+    for label, breakpoints in breakpoints_arr:
+
+        breakpoint_max = np.max(breakpoints)
+        breakpoint_min = np.min(breakpoints)
+
+        fig.suptitle('Probability of Connecting to Top-$k$ Degrees', fontsize=SMALL_SIZE)
+
+        for i in range(len(ax)):
+            ax[i].plot([0, 100 * breakpoint_max], [0, breakpoint_max], color='black', linestyle='--')
+            ax[i].set_xlim(100 * breakpoint_min, 100 * breakpoint_max)
+
+        for i, model in enumerate(df_model['Model']):
+            n = len(df_model['Top-$k$'].values[i])
+            indices = np.array([int(x * n) for x in breakpoints])
+            jitter = np.random.uniform(0, 0.1) * np.ones(len(indices))
+
+            color = palette[i]
+            linewidth = 1
+
+            if model == baseline_model and df_model['Environment'].values[i] == 'Baseline' and df_model['Temperature'].values[i] == default_temperature:
+                color = '#34495e'
+                linewidth = 3
+
+            ax[0].plot(100 * df_model['Top-$k$'].values[i][indices] + jitter, df_model['Probability of Connecting to Top-$k$'].values[i][indices] + jitter, label=model, color=color, linewidth=linewidth, marker='x')
+
+        ax[0].set_title('Model')
+        ax[0].set_xlabel('Top-$k$ (%)')
+        # ax[0].set_xscale('log')
+        # ax[0].set_yscale('log')
+        ax[0].set_ylabel('')
+
+        ax[0].legend(fontsize=0.7*SMALL_SIZE, ncol=2)
+
+        for i, temperature in enumerate(df_temperature['Temperature']):
+            n = len(df_model['Top-$k$'].values[i])
+            indices = np.array([int(x * n) for x in breakpoints])
+
+            color = palette[i]
+
+            color = palette[i]
+            linewidth = 1
+
+            if temperature == default_temperature and df_temperature['Model'].values[i] == baseline_model and df_temperature['Environment'].values[i] == 'Baseline':
+                color = '#34495e'
+                linewidth = 3
+
+            ax[1].plot(100 * df_temperature['Top-$k$'].values[i][indices], df_temperature['Probability of Connecting to Top-$k$'].values[i][indices], label=f'{temperature}', color=color, linewidth=linewidth, marker='x')
+
+        ax[1].set_title('Temperature')
+        ax[1].set_xlabel('Top-$k$ (%)')
+        # ax[1].set_xscale('log')
+        # ax[1].set_yscale('log')
+        ax[1].set_ylabel('')
+
+        ax[1].legend(fontsize=0.7*SMALL_SIZE)
+
+        for i, environment in enumerate(df_environment['Environment']):
+            n = len(df_model['Top-$k$'].values[i])
+            indices = np.array([int(x * n) for x in breakpoints])
+
+            color = palette[i]
+            linewidth = 1
+
+            if environment == 'Baseline' and df_environment['Model'].values[i] == baseline_model and df_environment['Temperature'].values[i] == default_temperature:
+                color = '#34495e'
+                linewidth = 3
+
+            ax[2].plot(100 * df_environment['Top-$k$'].values[i][indices], df_environment['Probability of Connecting to Top-$k$'].values[i][indices], label=environment, color=color, linewidth=linewidth, marker='x')
+
+        ax[2].set_title('Environment')
+        ax[2].set_xlabel('Top-$k$ (%)')
+        # ax[2].set_xscale('log')
+        # ax[2].set_yscale('log')
+        ax[2].set_ylabel('')
+
+        ax[2].legend(fontsize=0.7*SMALL_SIZE, ncols=2)
+
+        ax[0].set_ylim(0, 1)
+        ax[1].set_ylim(0, 1)
+        ax[2].set_ylim(0, 1)
+
+        # hide y axis numbers
+        ax[1].get_yaxis().set_visible(False)
+        ax[2].get_yaxis().set_visible(False)
+
+        ax[0].spines[['right', 'top']].set_visible(False)
+        ax[1].spines[['right', 'top']].set_visible(False)
+        ax[2].spines[['right', 'top']].set_visible(False)
+
+        fig.tight_layout()
+
+        fig.savefig(f'figures/probabilitytopk_{label}_{sfx}.pdf', bbox_inches='tight')
+
+
+def principle1_experiment_outfile(experiment, output_dir):
+    return str(os.path.join(os.fspath(output_dir), f"principle_1_{experiment['name']}.jsonl"))
+
+
+def principle1_build_experiment_record(experiment, output_dir, default_temperatures):
+    environment_role = experiment.get('environment')
+    if environment_role is None:
+        environment = None
+        role = 'friends'
+    else:
+        environment, role = environment_role
+
+    model = experiment['model']
+    return {
+        'experiment': experiment,
+        'name': experiment['name'],
+        'model': model,
+        'outfile': experiment.get('outfile', principle1_experiment_outfile(experiment, output_dir)),
+        'parameters': experiment['parameters'],
+        'temperatures': experiment.get('temperatures', default_temperatures),
+        'environment': environment,
+        'role': role,
+        'degrees': experiment.get('degrees_experiment', False),
+        'cot': experiment.get('COT', False),
+        'cot_config': experiment.get('cot_config'),
+        'hash_and_shuffle': experiment.get('hash_and_shuffle', False),
+        'metadata': {
+            'experiment_name': experiment['name'],
+            'model': model,
+            'environment': environment if environment is not None else 'Baseline',
+            'role': role,
+            'degrees_experiment': experiment.get('degrees_experiment', False),
+            'cot': experiment.get('COT', False),
+        },
+    }
+
+
+def principle1_run_configured_experiments(experiments, output_dir, default_temperatures, run_experiments=True, run_analysis=True):
+    supported_models = set(filter_supported_models(sorted({experiment['model'] for experiment in experiments})))
+    non_cot_outfiles = []
+    cot_outfiles = []
+    experiments_to_analyze = []
+    experiment_records = []
+
+    for experiment in experiments:
+        if not experiment.get('run', True):
+            continue
+
+        model = experiment['model']
+        if model not in supported_models:
+            print(f'Skipping {experiment["name"]}: {model} is not supported in this environment.')
+            continue
+
+        record = principle1_build_experiment_record(experiment, output_dir, default_temperatures)
+        experiment_records.append(record)
+
+        if experiment.get('include_in_exponent_summary', True):
+            if experiment.get('COT'):
+                cot_outfiles.append(record['outfile'])
+            else:
+                non_cot_outfiles.append(record['outfile'])
+
+        if experiment.get('analyze_detail', False):
+            experiments_to_analyze.append(record)
+
+    if run_experiments:
+        batch_groups = collections.defaultdict(list)
+        for record in experiment_records:
+            if record['model'].startswith('Qwen/') and record['experiment'].get('batch', True):
+                batch_key = (
+                    record['model'],
+                    record['cot'],
+                    json.dumps(record.get('cot_config'), sort_keys=True, default=str),
+                )
+                batch_groups[batch_key].append(record)
+                continue
+
+            principle1_run_network_formation_experiment(
+                **record['parameters'],
+                outfile=record['outfile'],
+                temperatures=record['temperatures'],
+                environment=record['environment'],
+                role=record['role'],
+                degrees=record['degrees'],
+                model=record['model'],
+                cot=record['cot'],
+                cot_config=record.get('cot_config'),
+                hash_and_shuffle=record['hash_and_shuffle'],
+                metadata=record['metadata'],
+            )
+
+        for records in batch_groups.values():
+            principle1_run_network_formation_experiments_batch(records)
+
+    if run_analysis:
+        for record in experiments_to_analyze:
+            principle1_analyze_experiments(record['outfile'], dgr=not record['degrees'])
+
+        if non_cot_outfiles:
+            principle1_analyze_experiments_multiple_llms(non_cot_outfiles)
+        if cot_outfiles:
+            principle1_analyze_experiments_multiple_llms(cot_outfiles, sfx='_cot')
+
+    return {
+        'supported_models': supported_models,
+        'non_cot_outfiles': non_cot_outfiles,
+        'cot_outfiles': cot_outfiles,
+        'experiments_to_analyze': experiments_to_analyze,
+        'experiment_records': experiment_records,
+    }
+
+# --- End Principle 1 preferential-attachment utilities ---
