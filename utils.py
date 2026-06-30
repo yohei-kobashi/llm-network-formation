@@ -5901,6 +5901,23 @@ def principle5_draw_graph(G, ax, G0=None, use_netgraph=True):
         netgraph.Graph(G, ax=ax, node_size=2.5, edge_width=1, node_color='#d35400', edge_color='#2c3e50', node_layout='circular', edge_layout='bundled', edge_layout_kwargs=dict(k=2000))
     ax.set_axis_off()
 
+def principle5_average_shortest_path_length_lcc(G):
+    """Average shortest path length on the largest connected component.
+
+    LLM rewiring (and generated W-S null models) can disconnect the graph, for
+    which nx.average_shortest_path_length raises 'Graph is not connected.'. Fall
+    back to the largest connected component, matching how combined_lcc is used
+    in the combined-model analysis. Returns nan for an empty graph and 0.0 for a
+    single-node component (no paths)."""
+    if G.number_of_nodes() == 0:
+        return float('nan')
+    if not nx.is_connected(G):
+        largest_cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(largest_cc)
+    if G.number_of_nodes() < 2:
+        return 0.0
+    return nx.average_shortest_path_length(G)
+
 def principle5_analyze_experiments(filename, suffix='', fit_beta_method='binary_search'):
     os.makedirs('figures/principle_5', exist_ok=True)
 
@@ -5934,7 +5951,7 @@ def principle5_analyze_experiments(filename, suffix='', fit_beta_method='binary_
 
         hat_beta = principle5_fit_beta_ws(Gs[-1], d['k'], method=fit_beta_method)
 
-        average_shortest_path_len = [nx.average_shortest_path_length(G) for G in Gs]
+        average_shortest_path_len = [principle5_average_shortest_path_length_lcc(G) for G in Gs]
         average_clustering_coefficient = [nx.average_clustering(G) for G in Gs]
         average_shortest_path_lengths[d['n'], d['k'], d['beta'], d['temperature']].append(average_shortest_path_len)
         average_clustering_coefficients[d['n'], d['k'], d['beta'], d['temperature']].append(average_clustering_coefficient)
@@ -5943,7 +5960,7 @@ def principle5_analyze_experiments(filename, suffix='', fit_beta_method='binary_
 
         G_WS_estimated = Gs_WS_estimated[-1]
 
-        average_shortest_path_len_WS_estimated = nx.average_shortest_path_length(G_WS_estimated)
+        average_shortest_path_len_WS_estimated = principle5_average_shortest_path_length_lcc(G_WS_estimated)
         average_clustering_coefficient_WS_estimated = nx.average_clustering(G_WS_estimated)
 
         hat_beta_record = {
@@ -6066,7 +6083,7 @@ def principle5_analyze_experiments(filename, suffix='', fit_beta_method='binary_
                 Gs, _ = principle5_network_growth(d['n'], d['k'], 1, d['temperature'], method='W-S', model=None, environment=None, role=None)
             else:
                 Gs, _ = principle5_network_growth(d['n'], d['k'], d['beta'], d['temperature'], method=method, model=None, environment=None, role=None)
-            average_shortest_path_lengths_null[method][d['n'], d['k'], d['beta'], d['temperature']].append([nx.average_shortest_path_length(G) for G in Gs])
+            average_shortest_path_lengths_null[method][d['n'], d['k'], d['beta'], d['temperature']].append([principle5_average_shortest_path_length_lcc(G) for G in Gs])
             average_clustering_coefficients_null[method][d['n'], d['k'], d['beta'], d['temperature']].append([nx.average_clustering(G) for G in Gs])
 
     for method in ['W-S']:
@@ -6200,7 +6217,7 @@ def principle5_plot_multiple_networks_small_world(filename, outfile):
             Gs.append(G)
 
         try:
-            average_shortest_path_len = nx.average_shortest_path_length(Gs[-1])
+            average_shortest_path_len = principle5_average_shortest_path_length_lcc(Gs[-1])
             average_clustering_coefficient = nx.average_clustering(Gs[-1])
 
             record = {
@@ -6228,7 +6245,7 @@ def principle5_plot_multiple_networks_small_world(filename, outfile):
         try:
             Gs, _ = principle5_network_growth(n, k, beta, 0, method='W-S')
 
-            average_shortest_path_len = nx.average_shortest_path_length(Gs[-1])
+            average_shortest_path_len = principle5_average_shortest_path_length_lcc(Gs[-1])
             average_clustering_coefficient = nx.average_clustering(Gs[-1])
 
             record = {
@@ -6372,7 +6389,7 @@ def principle5_get_table(filenames, sfx=''):
                 Gs.append(G)
 
             try:
-                average_shortest_path_len = nx.average_shortest_path_length(Gs[-1])
+                average_shortest_path_len = principle5_average_shortest_path_length_lcc(Gs[-1])
                 average_clustering_coefficient = nx.average_clustering(Gs[-1])
 
                 record = {
@@ -6401,7 +6418,7 @@ def principle5_get_table(filenames, sfx=''):
         for n, k, beta in seen:
             Gs, _ = principle5_network_growth(n, k, beta, 0, method='W-S', model='', environment='', role='')
 
-            average_shortest_path_len = nx.average_shortest_path_length(Gs[-1])
+            average_shortest_path_len = principle5_average_shortest_path_length_lcc(Gs[-1])
             average_clustering_coefficient = nx.average_clustering(Gs[-1])
 
             record = {
