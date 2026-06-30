@@ -946,6 +946,32 @@ COT_RETRY_MAX_NEW_TOKENS = 32768
 RESET_OUTFILES = set()
 
 
+def set_reset_outputs(value=True):
+    """Toggle 'redo from scratch' mode.
+
+    When enabled, the first time each output file is encountered during a run it
+    is deleted and regenerated from zero (overwriting the copy on Google Drive)
+    instead of resuming from the saved simulations. Call this once before the run
+    cell, e.g. set_reset_outputs(RESET_OUTPUTS)."""
+    global IGNORE_EXISTING_OUTPUTS
+    IGNORE_EXISTING_OUTPUTS = bool(value)
+    # Re-arm per-file removal so a fresh run with reset on deletes again.
+    RESET_OUTFILES.clear()
+
+
+def maybe_reset_outfile(outfile):
+    """Delete an existing output file once per run when reset mode is on, so the
+    experiment regenerates it from scratch instead of appending/skipping."""
+    if not IGNORE_EXISTING_OUTPUTS:
+        return
+    if outfile in RESET_OUTFILES:
+        return
+    if os.path.exists(outfile):
+        os.remove(outfile)
+        print(f'Reset: removed existing output file {outfile}')
+    RESET_OUTFILES.add(outfile)
+
+
 def set_principle2_runtime_options(ignore_existing_outputs=False, cot_retry_max_new_tokens=32768, medium_size=26):
     global IGNORE_EXISTING_OUTPUTS, COT_RETRY_MAX_NEW_TOKENS
     global MEDIUM_SIZE, SMALL_SIZE, BIGGER_SIZE
@@ -2651,6 +2677,8 @@ def principle2_run_configured_experiments(experiments, output_dir, default_tempe
             experiments_to_analyze.append(record)
 
     if run_experiments:
+        for record in experiment_records:
+            maybe_reset_outfile(record['outfile'])
         batch_groups = collections.defaultdict(list)
         for record in experiment_records:
             if record['model'].startswith('Qwen/') and record['method'] == 'llm' and record['experiment'].get('batch', True):
@@ -3902,6 +3930,8 @@ def principle1_run_configured_experiments(experiments, output_dir, default_tempe
             experiments_to_analyze.append(record)
 
     if run_experiments:
+        for record in experiment_records:
+            maybe_reset_outfile(record['outfile'])
         batch_groups = collections.defaultdict(list)
         for record in experiment_records:
             if record['model'].startswith('Qwen/') and record['experiment'].get('batch', True):
@@ -5340,6 +5370,8 @@ def principle3_run_configured_experiments(experiments, output_dir, default_tempe
             experiments_to_analyze.append(record)
 
     if run_experiments:
+        for record in experiment_records:
+            maybe_reset_outfile(record['outfile'])
         batch_groups = collections.defaultdict(list)
         for record in experiment_records:
             if record['model'].startswith('Qwen/') and record['method'] == 'llm' and record['experiment'].get('batch', True):
@@ -6628,6 +6660,8 @@ def principle5_run_configured_experiments(experiments, output_dir, default_tempe
             experiments_to_analyze.append(record)
 
     if run_experiments:
+        for record in experiment_records:
+            maybe_reset_outfile(record['outfile'])
         batch_groups = collections.defaultdict(list)
         for record in experiment_records:
             if record['model'].startswith('Qwen/') and record['method'] == 'llm' and record['experiment'].get('batch', True):
@@ -6967,6 +7001,7 @@ def combined_run_network_formation_experiment(name, num_simulations, outfile, te
         temperatures = [None]
 
     os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    maybe_reset_outfile(outfile)
 
     saved_scenarios = set()
 
