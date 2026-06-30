@@ -3705,7 +3705,7 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
         ax[0].legend(fontsize=0.7*SMALL_SIZE, ncol=2)
 
         for i, temperature in enumerate(df_temperature['Temperature']):
-            n = len(df_model['Top-$k$'].values[i])
+            n = len(df_temperature['Top-$k$'].values[i])
             indices = np.array([int(x * n) for x in breakpoints])
 
             color = palette[i]
@@ -3728,7 +3728,7 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
         ax[1].legend(fontsize=0.7*SMALL_SIZE)
 
         for i, environment in enumerate(df_environment['Environment']):
-            n = len(df_model['Top-$k$'].values[i])
+            n = len(df_environment['Top-$k$'].values[i])
             indices = np.array([int(x * n) for x in breakpoints])
 
             color = palette[i]
