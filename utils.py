@@ -74,7 +74,7 @@ SHARED_MODEL_NAMES = [
     'Qwen/Qwen3.5-4B',
     'Qwen/Qwen3.5-0.8B',
 ]
-SHARED_DEFAULT_TEMPERATURES = [None]
+SHARED_DEFAULT_TEMPERATURES = [1.0]
 SHARED_DEFAULT_COT_CONFIG = {'max_new_tokens': 8192, 'qwen_enable_thinking': True}
 SHARED_COT_RETRY_MAX_NEW_TOKENS = 32768
 
