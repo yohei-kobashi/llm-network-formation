@@ -3273,6 +3273,20 @@ def principle1_reconstruct_graphs(d):
 
     return Gs
 
+def _safe_power_law_subfit(fit):
+    """Return ``fit.power_law`` or ``None`` if the degree distribution is too
+    degenerate to fit. A near-star graph (e.g. an LLM that almost always picks
+    node 0) yields ``xmin=nan``; accessing ``fit.power_law`` then triggers a
+    lazy fit that raises ``ValueError: No data points in defined range of the
+    distribution.`` Callers fall back to nan / skip the fitted-line plot."""
+    try:
+        power_law = fit.power_law
+        # Force the lazy fit so a degenerate-distribution failure surfaces here.
+        _ = power_law.alpha
+        return power_law
+    except Exception:
+        return None
+
 def principle1_analyze_experiments(filename, dgr=True):
     os.makedirs('figures/principle_1', exist_ok=True)
 
@@ -3343,9 +3357,14 @@ def principle1_analyze_experiments(filename, dgr=True):
         gammas_barabasi_albert[d['n'], d['temperature']].append(powerlaw_fit_barabasi_albert.alpha)
         sigmas_barabasi_albert[d['n'], d['temperature']].append(powerlaw_fit_barabasi_albert.sigma)
 
-        ks_stat_powerlaw = getattr(powerlaw_fit.power_law, 'D', None)
-        if ks_stat_powerlaw is None:
-            ks_stat_powerlaw = powerlaw_fit.power_law.KS(degrees)
+        llm_power_law = _safe_power_law_subfit(powerlaw_fit)
+        if llm_power_law is None:
+            print(f'  Skipping power-law fit for n={d["n"]}, temperature={d["temperature"]}: degree distribution is degenerate (likely a star graph).')
+            ks_stat_powerlaw = float('nan')
+        else:
+            ks_stat_powerlaw = getattr(llm_power_law, 'D', None)
+            if ks_stat_powerlaw is None:
+                ks_stat_powerlaw = llm_power_law.KS(degrees)
         ks_powerlaw[d['n'], d['temperature']].append(ks_stat_powerlaw)
 
         ax[-1].set_title('Degree distribution')
@@ -3358,7 +3377,8 @@ def principle1_analyze_experiments(filename, dgr=True):
 
         powerlaw_fit_barabasi_albert.plot_ccdf(linewidth=3, ax=ax_barabasi_albert[-1], color='#3498db', label='BA (Empirical)')
 
-        powerlaw_fit.power_law.plot_ccdf(ax=ax[-1], color='#e74c3c', linestyle='--', label='LLM (Power law fit)')
+        if llm_power_law is not None:
+            llm_power_law.plot_ccdf(ax=ax[-1], color='#e74c3c', linestyle='--', label='LLM (Power law fit)')
         powerlaw_fit_barabasi_albert.power_law.plot_ccdf(ax=ax[-1], color='#3498db', linestyle='--', label='BA (Power law fit)')
 
         powerlaw_fit_barabasi_albert.power_law.plot_ccdf(ax=ax_barabasi_albert[-1], color='#3498db', linestyle='--', label='BA (Power law fit)')
@@ -3409,7 +3429,9 @@ def principle1_analyze_experiments(filename, dgr=True):
     for i, k in enumerate(sorted(pwl_fits.keys())):
         powerlaw_fit = pwl_fits[k][0]
         powerlaw_fit.plot_ccdf(linewidth=3, ax=ax[0, -1], color=palette[i], label=str(k[-1]))
-        powerlaw_fit.power_law.plot_ccdf(ax=ax[0, -1], color=palette[i], linestyle='--')
+        summary_power_law = _safe_power_law_subfit(powerlaw_fit)
+        if summary_power_law is not None:
+            summary_power_law.plot_ccdf(ax=ax[0, -1], color=palette[i], linestyle='--')
 
 
     for i, k in enumerate(sorted(pwl_fits.keys())):
