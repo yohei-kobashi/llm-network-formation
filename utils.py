@@ -3315,6 +3315,20 @@ def _safe_power_law_subfit(fit):
     except Exception:
         return None
 
+def _safe_power_law_fit(degrees, **kwargs):
+    """Build a ``powerlaw.Fit`` or return ``None`` when ``degrees`` is empty or
+    too small to fit. ``pwl.Fit([])`` raises ``ValueError: zero-size array to
+    reduction operation minimum which has no identity`` because it computes
+    ``np.min(data)`` on an empty array; this happens when the final graph for a
+    simulation has no non-isolated nodes (e.g. parsing failed and no edges were
+    ever formed). Callers fall back to nan / skip the fit and plots."""
+    if degrees is None or len(degrees) == 0:
+        return None
+    try:
+        return pwl.Fit(degrees, **kwargs)
+    except Exception:
+        return None
+
 def principle1_analyze_experiments(filename, dgr=True):
     os.makedirs('figures/principle_1', exist_ok=True)
 
@@ -3372,11 +3386,25 @@ def principle1_analyze_experiments(filename, dgr=True):
         degrees = [G.degree(n) for n in G.nodes()]
         degrees_barabasi_albert = [G_barabasi_albert.degree(n) for n in G_barabasi_albert.nodes()]
 
-        powerlaw_fit = pwl.Fit(degrees, discrete=True)
+        powerlaw_fit = _safe_power_law_fit(degrees, discrete=True)
+        powerlaw_fit_barabasi_albert = pwl.Fit(degrees_barabasi_albert, discrete=True)
+
+        if powerlaw_fit is None:
+            print(f'  Skipping power-law analysis for n={d["n"]}, temperature={d["temperature"]}: '
+                  f'final graph has no non-isolated nodes (|degrees|={len(degrees)}).')
+            wasserstein_distances[d['n'], d['temperature']].append(float('nan'))
+            gammas[d['n'], d['temperature']].append(float('nan'))
+            sigmas[d['n'], d['temperature']].append(float('nan'))
+            gammas_barabasi_albert[d['n'], d['temperature']].append(powerlaw_fit_barabasi_albert.alpha)
+            sigmas_barabasi_albert[d['n'], d['temperature']].append(powerlaw_fit_barabasi_albert.sigma)
+            ks_powerlaw[d['n'], d['temperature']].append(float('nan'))
+            pwl_fits[d['n'], d['temperature']].append(None)
+            pwl_fits_barabasi_albert[d['n'], d['temperature']].append(powerlaw_fit_barabasi_albert)
+            plt.close(fig)
+            plt.close(fig_barabasi_albert)
+            continue
 
         print(f'Temperature {d["temperature"]}: xmin: {powerlaw_fit.xmin}, alpha: {powerlaw_fit.alpha}, sigma: {powerlaw_fit.sigma}')
-
-        powerlaw_fit_barabasi_albert = pwl.Fit(degrees_barabasi_albert, discrete=True)
 
         wasserstein_distances[d['n'], d['temperature']].append(stats.wasserstein_distance(degrees, degrees_barabasi_albert))
         gammas[d['n'], d['temperature']].append(powerlaw_fit.alpha)
@@ -3456,6 +3484,8 @@ def principle1_analyze_experiments(filename, dgr=True):
 
     for i, k in enumerate(sorted(pwl_fits.keys())):
         powerlaw_fit = pwl_fits[k][0]
+        if powerlaw_fit is None:
+            continue
         powerlaw_fit.plot_ccdf(linewidth=3, ax=ax[0, -1], color=palette[i], label=str(k[-1]))
         summary_power_law = _safe_power_law_subfit(powerlaw_fit)
         if summary_power_law is not None:
@@ -3508,6 +3538,10 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
             degrees = np.array([G.degree(n) for n in G.nodes()])
             degrees_barabasi_albert = np.array([G_barabasi_albert.degree(n) for n in G_barabasi_albert.nodes()])
 
+            if len(degrees) == 0:
+                print(f'  Skipping {filename} record (n={d["n"]}, temperature={d["temperature"]}): '
+                      f'final graph has no non-isolated nodes.')
+                continue
 
             powerlaw_fit = pwl.Fit(degrees, discrete=True)
 
