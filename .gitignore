@@ -171,3 +171,5 @@ figures/
 figures-revised/
 powerlaw_tests/
 *.pdf
+# Notebooks are maintained locally/in Colab only (they contain pasted credentials)
+*.ipynb

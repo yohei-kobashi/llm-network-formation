@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Principle 2 / 暫定結果レポート</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #20242a;
+      --muted: #5d6673;
+      --line: #d9dee5;
+      --panel: #f6f8fa;
+      --accent: #8a4b1f;
+      --accent-2: #1f6f8b;
+    }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: #fff;
+      line-height: 1.65;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 48px 24px 72px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 32px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 40px 0 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    h3 {
+      margin: 24px 0 8px;
+      font-size: 17px;
+    }
+    p {
+      margin: 10px 0;
+    }
+    .meta {
+      color: var(--muted);
+      margin-bottom: 28px;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin: 24px 0;
+    }
+    .tile {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px 16px;
+      border-radius: 8px;
+    }
+    .tile strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 14px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .tile span {
+      font-size: 20px;
+      font-weight: 700;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 24px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: var(--panel);
+      font-weight: 700;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.95em;
+      background: #eef1f5;
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    ul {
+      padding-left: 22px;
+    }
+    .note {
+      border-left: 4px solid var(--accent-2);
+      background: #f2f7fb;
+      padding: 12px 16px;
+      margin: 18px 0;
+    }
+    .warning {
+      border-left-color: var(--accent);
+      background: #fff7f0;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>LLM ネットワーク形成シミュレーション：暫定結果レポート</h1>
+  <p class="meta">
+    Source: <code>principle_2.ipynb</code> の保存済み実行出力（数値は notebook 内の図から読み取った概数）。
+    本研究全体の文脈と、現時点で結果の出ている Principle 2 を中心にまとめる。
+  </p>
+
+  <div class="summary">
+    <div class="tile"><strong>最終目標</strong><span>Homophily / Minorities の課題抽出</span></div>
+    <div class="tile"><strong>現段階</strong><span>先行研究の再現 + reasoning 影響</span></div>
+    <div class="tile"><strong>確定結果</strong><span>Principle 2 のみ</span></div>
+    <div class="tile"><strong>Simulation</strong><span>各条件 1 回（予備的）</span></div>
+  </div>
+
+  <h2>研究の背景と位置づけ</h2>
+  <p>
+    本研究の最終目標は、<strong>複層的なホモフィリー（homophily）とマイノリティ（minorities）による人間関係ネットワークの形成</strong>を
+    LLM でシミュレーションする際の課題を明らかにすることである。理論的な参照枠組みとして、
+    Currarini, Jackson &amp; Pin (2009) <em>“An Economic Model of Friendship: Homophily, Minorities, and Segregation”</em>
+    (Econometrica 77(4), 1003–1045) を用いる。同モデルは、選好に基づく友人形成において、
+    グループのサイズ（マイノリティ／マジョリティ）がホモフィリーや分離（segregation）の度合いをどのように規定するかを定式化している。
+  </p>
+  <p>
+    その前段階として、本作業では Papachristou &amp; Yuan (2025)
+    <em>“Network formation and dynamics among multi-LLMs”</em> (PNAS Nexus, Vol. 4, No. 12) を
+    <strong>再現実験</strong>し、あわせて <strong>reasoning（CoT / thinking）が結果に及ぼす影響</strong>を確認している。
+    再現対象は同論文の各 principle（1: 優先的選択 / 2: triadic closure / 3: homophily / 4: community 構造 / 5: small-world）であり、
+    最終的に Currarini 型の homophily・minorities 設定へ拡張することを想定する。
+  </p>
+  <div class="note">
+    <p>
+      <strong>現状</strong>：再現実験のうち <strong>結果が安定して出ているのは Principle 2 のみ</strong>である。
+      Principle 1 はパイプライン上の課題（後述）が判明し、再現に至っていない。
+      Principle 3 / 4 / 5 は未実行。したがって本レポートは Principle 2 を中心とした
+      <strong>暫定サマリー</strong>であり、最終結論ではない。
+    </p>
+  </div>
+
+  <h2>Principle 2 の目的</h2>
+  <p>
+    Principle 2 では、LLM がネットワーク形成時に triadic closure、つまり共通の友人が多い相手を選ぶ傾向を示すかを評価した。
+    実験では、初期グラフから各ノードが新しい友人を選び、その結果として transitivity と community 内接続がどの程度増えるかを測定している。
+    これは Currarini モデルが扱う「同質な相手・既存の結びつきに近い相手への選好」を、最も単純な形で検証する位置づけにある。
+  </p>
+
+  <h2>実験条件</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>条件</th>
+        <th>内容</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>SBM, non-CoT</td>
+        <td><code>gpt-5-nano</code>, <code>Qwen/Qwen3.5-4B</code>, <code>Qwen/Qwen3.5-0.8B</code> の baseline 比較。</td>
+      </tr>
+      <tr>
+        <td>Environment prompts</td>
+        <td>Qwen 3.5 4B で <code>school</code>, <code>work</code>, <code>community</code> の文脈を追加。</td>
+      </tr>
+      <tr>
+        <td>ER initialization</td>
+        <td>Qwen 3.5 4B を ER 初期グラフで実行。</td>
+      </tr>
+      <tr>
+        <td>SBM, CoT</td>
+        <td>Qwen 3.5 4B に thinking / CoT を有効化して実行。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>評価指標</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>指標</th>
+        <th>意味</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>D</code></td>
+        <td>Marginal transitivity。初期グラフから最終グラフまでに transitivity がどれだけ増えたか。</td>
+      </tr>
+      <tr>
+        <td><code>p_hat</code></td>
+        <td>Probability of edge within community。新しく作られた辺が同一 community 内にできる確率。</td>
+      </tr>
+      <tr>
+        <td>Top-k common neighbors</td>
+        <td>共通友人が多い上位 k% の候補へ接続する確率。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>主要結果（Principle 2）</h2>
+  <h3>SBM, non-CoT</h3>
+  <p>
+    非CoT の SBM 条件では、各モデルが random null より triadic closure 的な選択を示した。
+    Qwen 3.5 4B は marginal transitivity が高めで、GPT-5 Nano と Qwen 0.8B は community 内接続確率が高めだった。
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>条件</th>
+        <th>D 概数</th>
+        <th>p_hat 概数</th>
+        <th>解釈</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>GPT-5 Nano</td>
+        <td>約 0.05</td>
+        <td>約 0.72</td>
+        <td>Community 内接続が強い。</td>
+      </tr>
+      <tr>
+        <td>Qwen 3.5 4B</td>
+        <td>約 0.06</td>
+        <td>約 0.57</td>
+        <td>Transitivity が高め。</td>
+      </tr>
+      <tr>
+        <td>Qwen 3.5 0.8B</td>
+        <td>約 0.04</td>
+        <td>約 0.71</td>
+        <td>Transitivity は低めだが community 内接続は高い。</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    いずれも random null を上回る triadic closure を示しており、先行研究
+    (Papachristou &amp; Yuan, Fig. 2)の「全モデルで D が有意に正に増加する」という定性的結論と整合する。
+  </p>
+
+  <h3>Environment prompts</h3>
+  <p>
+    環境プロンプトは選択傾向に影響している。図からは、<code>work</code> 条件で marginal transitivity が高く、
+    <code>community</code> 条件では community 内接続確率が高い傾向が読み取れる。
+    文脈依存の選択は、Currarini モデルが想定する「属性・環境による選好の差」を LLM が部分的に再現していることを示唆する。
+  </p>
+
+  <h3>CoT</h3>
+  <p>
+    CoT 条件では、非CoT よりかなり強い triadic closure が出ている。
+    Qwen 3.5 4B の CoT 実行では、<code>D</code> が図の上限付近の約 0.10、
+    <code>p_hat</code> が約 0.93 まで上昇している。
+  </p>
+  <p>
+    Top-k common neighbors の図でも、上位 common-neighbor 候補への接続が明確に集中している。
+    これは、CoT によってモデルが候補者の友人関係を明示的に比較し、共通友人が多い相手を選びやすくなったためと解釈できる。
+  </p>
+
+  <h3>ER initialization</h3>
+  <p>
+    ER 初期化でも、Qwen 3.5 4B は random より高い marginal transitivity を示した。
+    図からは Qwen 3.5 4B が約 0.125、random null が約 0.05 と読める。
+    ER は明示的な community 構造を持たないため、モデルが局所的な友人関係から triadic closure 的な選択を作り出している可能性がある。
+    これは先行研究の「ER 初期化では D がさらに強まる」という報告とも一致する。
+  </p>
+
+  <h2>reasoning（CoT / thinking）が及ぼす影響</h2>
+  <p>
+    本研究のもう一つの主眼は、<strong>reasoning が社会的選択行動に与える影響</strong>である。Principle 2 の範囲では、
+    次の傾向が観察された。
+  </p>
+  <ul>
+    <li>
+      <strong>triadic closure の強化</strong>：Qwen 3.5 4B で <code>D</code> が約 0.06 → 0.10、
+      <code>p_hat</code> が約 0.57 → 0.93 へ上昇。CoT は候補比較を明示化し、共通友人の多い相手への集中を強める。
+    </li>
+    <li>
+      <strong>選択の「鋭さ」を増す方向</strong>：reasoning は曖昧さを減らし、原理に沿った選択（ここでは triadic closure）を増幅する。
+      これは Principle 2 では望ましい方向に働くが、原理によっては副作用になり得る（後述の課題を参照）。
+    </li>
+  </ul>
+  <p>
+    したがって暫定的には、「<strong>CoT は社会的選択理由を明示化し、局所ネットワーク情報への依存を強める</strong>」という仮説が支持される。
+    論文化の際は、CoT を通常推論とは別条件として明確に分けて記述するのが妥当である。
+  </p>
+
+  <h2>これまでに判明した課題</h2>
+  <p>
+    本研究の目的（LLM で人間関係ネットワーク形成をシミュレートする際の課題抽出）に直結する知見として、
+    再現実験のセットアップ段階で以下の課題が判明した。
+  </p>
+
+  <h3>1. デコード温度が原理ごとに再現性を左右する（最重要）</h3>
+  <div class="note warning">
+    <p>
+      現状の既定設定では温度が <code>default</code>（= vLLM 経路で <code>temperature=0.0</code>、すなわち貪欲デコード）になっている。
+      <strong>Principle 1（優先的選択）はこの貪欲デコードで再現に失敗する</strong>。
+      優先的選択（Barabási–Albert）は本来 <em>確率的</em> 選択（接続確率 ∝ 次数）で初めてべき乗則の次数分布を生むが、
+      貪欲デコードでは「最も次数の高い 1 ノードを常に選ぶ」決定論的挙動になり、結果は
+      <strong>スター型グラフへ縮退</strong>する。この現象は Qwen 3.5（4B / 0.8B）だけでなく
+      <code>gpt-5-nano</code> でも観測され、<strong>モデル規模ではなく設定（温度）に起因</strong>する。
+    </p>
+  </div>
+  <p>
+    一方で <strong>Principle 2（triadic closure）は同じ貪欲デコードでも破綻しない</strong>。
+    これは triadic closure が温度にロバストな「傾向」現象であり（先行研究も同旨を明記）、
+    「共通友人が最多の相手を選ぶ」決定論的選択がそのまま正しい巨視的パターン（高い D・p_hat）を与えるためである。
+    つまり <strong>原理ごとに必要な確率性が異なる</strong>ことが、LLM シミュレーションの設計上の重要な課題として浮かび上がった。
+    Principle 1 を再現するには、論文同様に <code>temperature</code> を 1.0–1.5 程度に設定して確率的選択を回復させる必要がある。
+  </p>
+
+  <h3>2. 統計的有意性が未確立（num_simulations=1）</h3>
+  <p>
+    現状は各条件 1 回の実行のため、t-test は <code>nan</code> となり統計的有意性を判断できない。
+    seed や個別生成の揺らぎを分離できず、結果はあくまで予備的傾向である。
+  </p>
+
+  <h3>3. 出力形式の頑健性</h3>
+  <p>
+    CoT では一部 parse recovery（出力形式エラーからの復旧）が使われており、出力フォーマットの不安定性が残る。
+    また長大化する thinking 出力に対しては、初回 8192 トークン → 失敗時に thinking を無効化して再試行する戦略で
+    無限ループ・過大トークンを回避している。
+  </p>
+
+  <h3>4. 縮退グラフに対する解析の頑健化</h3>
+  <p>
+    弱いモデルや貪欲デコードが生む縮退グラフ（スター・非連結）で、解析コードが例外停止する問題があった。
+    Principle 1 の powerlaw fit（縮退時はスキップして <code>nan</code> 記録）、
+    Principle 5 の最短路長（非連結時は最大連結成分上で計算）を頑健化済み。
+    これにより、縮退した結果でも解析を完走し「再現できていないこと自体」を可視化できる。
+  </p>
+
+  <h2>CoT Token Budget Calibration</h2>
+  <p>
+    本レポートの Principle 2 実行時点では、CoT の retry 用 <code>max_new_tokens</code> は 20 回の calibration により
+    <code>16384</code> が選ばれていた。手順は、<code>65536</code> を上限にした予備実行で最初の parseable JSON が出る位置を記録し、
+    <code>P90 × 1.5</code> を標準 bucket に丸めるものだった。
+  </p>
+  <div class="note">
+    <p>
+      なお現行パイプラインでは方針を見直し、初回 <code>max_new_tokens=8192</code> ＋
+      「1 回失敗したら 2 回目で即 <code>thinking=False</code> に切替」という再試行戦略に変更している。
+      上記 16384 は本 Principle 2 実行時の値であり、最新コードでの再実行値とは厳密一致しない可能性がある。
+    </p>
+  </div>
+
+  <h2>制約</h2>
+  <div class="note warning">
+    <p>
+      最大の制約は <code>num_simulations=1</code> である点である。
+      そのため t-test は <code>nan</code> になっており、統計的有意性は判断できない。
+      現時点の結果は予備的な傾向として解釈すべきである。
+    </p>
+  </div>
+  <ul>
+    <li>各条件 1 回のみなので、seed や個別生成の影響を分離できない。</li>
+    <li>CoT では一部 parse recovery が使われており、出力形式エラーの影響を完全には排除できない。</li>
+    <li>図の値は notebook 出力からの読み取りであり、厳密値ではない。</li>
+    <li>Principle 1 / 3 / 4 / 5 は未確定（Principle 1 は温度設定の課題により再現未達）。</li>
+  </ul>
+
+  <h2>今後の計画</h2>
+  <ul>
+    <li><strong>Principle 1 の再現</strong>：<code>temperature</code> を 1.0–1.5 にして確率的優先選択を回復させ、べき乗則 / BA 近似を確認する。</li>
+    <li><strong>Principle 3 / 4 / 5 の実行</strong>：homophily（assortativity）、community 構造、small-world を順次確認する。</li>
+    <li><strong>複数 simulation 化</strong>：各条件を複数回実行し、t-test による有意性を確立する。</li>
+    <li><strong>reasoning 比較の体系化</strong>：CoT 有無を全 principle で対照条件として整理する。</li>
+    <li><strong>Currarini 型設定への拡張</strong>：再現が固まった後、homophily・minorities（グループサイズ非対称）・segregation を導入し、
+      LLM シミュレーションが理論モデルの予測（マイノリティのホモフィリー・分離）をどこまで再現／逸脱するかを検証する。</li>
+  </ul>
+
+  <h2>結論（暫定）</h2>
+  <p>
+    現段階で安定した結果が出ているのは Principle 2 のみであり、そこでは
+    LLM がランダムではなく共通友人や community 構造を利用して接続先を選ぶ triadic closure 的傾向を示した。
+    とくに CoT 条件では候補比較が明示化され、triadic closure が大幅に強まる。
+  </p>
+  <p>
+    一方で再現実験のセットアップを通じて、<strong>「原理ごとに必要な確率性（温度）が異なる」</strong>という、
+    本研究の目的に直結する課題が早期に判明した。Principle 2 のように温度ロバストな傾向は LLM で容易に再現できるが、
+    Principle 1 のように確率的選択を要する原理は、貪欲デコード下では縮退してしまう。
+    この知見は、最終目標である Currarini 型の homophily・minorities シミュレーションにおいても、
+    <strong>選択の確率性・reasoning の有無が結果を質的に変えうる</strong>ことを示唆しており、設計上の重要な論点となる。
+  </p>
+  <p>
+    最終的な主張には、温度設定を是正した Principle 1 の再現、残る principle の実行、
+    および複数 simulation による有意性検証が必要である。
+  </p>
+</main>
+</body>
+</html>
