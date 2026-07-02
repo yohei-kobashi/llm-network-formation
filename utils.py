@@ -2383,15 +2383,16 @@ def principle2_get_table(filenames, sfx='', environments=True, transitivity_null
 
     fig.savefig(f'figures/triadic_closure{sfx}.pdf', bbox_inches='tight')
 
-    fig, ax = plt.subplots(1, ncols, figsize=(5 * ncols, 5))
-
     palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9']
-
-    fig.suptitle(f'{condition_label}: Probability of Connecting to Top-$k$ Common Neighbors', fontsize=SMALL_SIZE)
 
     breakpoints_arr = [('top', np.array([0.1, 0.2, 0.3, 0.4, 0.5])), ('all', np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99]))]
 
     for label, breakpoints in breakpoints_arr:
+        # A fresh figure per breakpoint range: reusing the same axes across
+        # iterations re-plots every line, duplicating the legend entries.
+        fig, ax = plt.subplots(1, ncols, figsize=(5 * ncols, 5))
+        fig.suptitle(f'{condition_label}: Probability of Connecting to Top-$k$ Common Neighbors', fontsize=SMALL_SIZE)
+
         breakpoint_max = np.max(breakpoints)
         breakpoint_min = np.min(breakpoints)
 
@@ -3792,8 +3793,6 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
 
     fig.savefig(f'figures/exponents{sfx}.pdf', bbox_inches='tight')
 
-    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-
     # plot probability of connecting to top-k
 
     palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9']
@@ -3803,6 +3802,10 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
     breakpoints_arr = [('top', np.array([0.01, 0.015, 0.02, 0.025])), ('all', np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99]))]
 
     for label, breakpoints in breakpoints_arr:
+
+        # A fresh figure per breakpoint range: reusing the same axes across
+        # iterations re-plots every line, duplicating the legend entries.
+        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
 
         breakpoint_max = np.max(breakpoints)
         breakpoint_min = np.min(breakpoints)
