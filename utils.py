@@ -3704,11 +3704,11 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
         'Qwen-Qwen3.5-4B' : 'Qwen 3.5 4B',
         'Qwen-Qwen3.5-2B' : 'Qwen 3.5 2B',
         'Qwen-Qwen3.5-0.8B' : 'Qwen 3.5 0.8B',
-        'gpt-5-nano_cot' : 'GPT-5 Nano',
-        'gpt-5-mini_cot' : 'GPT-5 Mini',
-        'Qwen-Qwen3.5-4B_cot' : 'Qwen 3.5 4B',
-        'Qwen-Qwen3.5-2B_cot' : 'Qwen 3.5 2B',
-        'Qwen-Qwen3.5-0.8B_cot' : 'Qwen 3.5 0.8B',
+        'gpt-5-nano_cot' : 'GPT-5 Nano-CoT',
+        'gpt-5-mini_cot' : 'GPT-5 Mini-CoT',
+        'Qwen-Qwen3.5-4B_cot' : 'Qwen 3.5 4B-CoT',
+        'Qwen-Qwen3.5-2B_cot' : 'Qwen 3.5 2B-CoT',
+        'Qwen-Qwen3.5-0.8B_cot' : 'Qwen 3.5 0.8B-CoT',
     }
 
     rename_environment = {
@@ -3736,25 +3736,26 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
     df_model = df.query('Environment == "Baseline" and Temperature == @default_temperature')
     df_model = df_model[df_model['Model'] != 'Barabasi-Albert']
 
-    df_environment = df.query('Model == @baseline_model and Temperature == @default_temperature')
-    df_temperature = df.query('Model == @baseline_model and Environment == "Baseline"')
+    # Model comparison panel: base models plus the baseline model's CoT
+    # variant as its own bar, in a fixed left-to-right order.
+    model_order = ['GPT-5 Nano', 'Qwen 3.5 0.8B', 'Qwen 3.5 4B', f'{baseline_model}-CoT']
+    df_model = df_model.copy()
+    df_model['__order'] = df_model['Model'].apply(
+        lambda m: model_order.index(m) if m in model_order else len(model_order))
+    df_model = df_model.sort_values('__order').drop(columns='__order').reset_index(drop=True)
 
-    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+    df_environment = df.query('Model == @baseline_model and Temperature == @default_temperature')
+
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
 
     sc_model = sns.barplot(data=df_model, y='$\\hat \\gamma$', x='Model', ax=ax[0], palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'])
-    sc_temperature = sns.barplot(data=df_temperature, y='$\\hat \\gamma$', x='Temperature', ax=ax[1], palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'])
-    sc_environment = sns.barplot(data=df_environment, y='$\\hat \\gamma$', x='Environment', ax=ax[2], palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'])
-
-
-
+    sc_environment = sns.barplot(data=df_environment, y='$\\hat \\gamma$', x='Environment', ax=ax[1], palette=['#e67e22', '#f1c40f', '#3498db', '#7f8c8d', '#c0392b', '#34495e', '#2980b9'])
 
     sc_model.set_xticklabels(sc_model.get_xticklabels(), rotation=90)
-    sc_temperature.set_xticklabels(sc_temperature.get_xticklabels(), rotation=90)
     sc_environment.set_xticklabels(sc_environment.get_xticklabels(), rotation=90)
 
     ax[0].errorbar(df_model['Model'], df_model['$\\hat \\gamma$'], yerr=df_model['$\\sigma$'], color='black', linestyle='', capsize=10, alpha=0.5)
-    ax[1].errorbar(df_temperature['Temperature'].astype(str), df_temperature['$\\hat \\gamma$'], yerr=df_temperature['$\\sigma$'], color='black', linestyle='', capsize=10, alpha=0.5)
-    ax[2].errorbar(df_environment['Environment'], df_environment['$\\hat \\gamma$'], yerr=df_environment['$\\sigma$'], color='black', linestyle='', capsize=10, alpha=0.5)
+    ax[1].errorbar(df_environment['Environment'], df_environment['$\\hat \\gamma$'], yerr=df_environment['$\\sigma$'], color='black', linestyle='', capsize=10, alpha=0.5)
 
 
 
@@ -3764,42 +3765,34 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
     # draw baraasi-albert line
     ax[0].axhline(y=gamma_ba, color='#c0392b', linestyle='--', label='BA (Sample)', linewidth=3)
     ax[1].axhline(y=gamma_ba, color='#c0392b', linestyle='--', label='BA (Sample)', linewidth=3)
-    ax[2].axhline(y=gamma_ba, color='#c0392b', linestyle='--', label='BA (Sample)', linewidth=3)
 
     ax[0].axhline(y=3, color='#34495e', linestyle=':', label='BA (Theoretical)', linewidth=3)
     ax[1].axhline(y=3, color='#34495e', linestyle=':', label='BA (Theoretical)', linewidth=3)
-    ax[2].axhline(y=3, color='#34495e', linestyle=':', label='BA (Theoretical)', linewidth=3)
 
     ax[0].legend(fontsize=0.7*SMALL_SIZE)
 
     ax[0].set_ylim(1, 5)
     ax[1].set_ylim(1, 5)
-    ax[2].set_ylim(1, 5)
 
     ax[1].set_ylabel('')
-    ax[2].set_ylabel('')
 
     ax[0].set_xlabel('')
     ax[1].set_xlabel('')
-    ax[2].set_xlabel('')
 
     ax[0].set_title('Model')
-    ax[1].set_title('Temperature')
-    ax[2].set_title('Environment')
+    ax[1].set_title('Environment')
 
 
     ax[1].get_yaxis().set_visible(False)
-    ax[2].get_yaxis().set_visible(False)
 
     ax[0].spines[['right', 'top']].set_visible(False)
     ax[1].spines[['right', 'top']].set_visible(False)
-    ax[2].spines[['right', 'top']].set_visible(False)
 
     # fig.tight_layout()
 
     fig.savefig(f'figures/exponents{sfx}.pdf', bbox_inches='tight')
 
-    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
 
     # plot probability of connecting to top-k
 
@@ -3842,29 +3835,6 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
 
         ax[0].legend(fontsize=0.7*SMALL_SIZE, ncol=2)
 
-        for i, temperature in enumerate(df_temperature['Temperature']):
-            n = len(df_temperature['Top-$k$'].values[i])
-            indices = np.array([int(x * n) for x in breakpoints])
-
-            color = palette[i]
-
-            color = palette[i]
-            linewidth = 1
-
-            if temperature == default_temperature and df_temperature['Model'].values[i] == baseline_model and df_temperature['Environment'].values[i] == 'Baseline':
-                color = '#34495e'
-                linewidth = 3
-
-            ax[1].plot(100 * df_temperature['Top-$k$'].values[i][indices], df_temperature['Probability of Connecting to Top-$k$'].values[i][indices], label=f'{temperature}', color=color, linewidth=linewidth, marker='x')
-
-        ax[1].set_title('Temperature')
-        ax[1].set_xlabel('Top-$k$ (%)')
-        # ax[1].set_xscale('log')
-        # ax[1].set_yscale('log')
-        ax[1].set_ylabel('')
-
-        ax[1].legend(fontsize=0.7*SMALL_SIZE)
-
         for i, environment in enumerate(df_environment['Environment']):
             n = len(df_environment['Top-$k$'].values[i])
             indices = np.array([int(x * n) for x in breakpoints])
@@ -3876,27 +3846,24 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
                 color = '#34495e'
                 linewidth = 3
 
-            ax[2].plot(100 * df_environment['Top-$k$'].values[i][indices], df_environment['Probability of Connecting to Top-$k$'].values[i][indices], label=environment, color=color, linewidth=linewidth, marker='x')
+            ax[1].plot(100 * df_environment['Top-$k$'].values[i][indices], df_environment['Probability of Connecting to Top-$k$'].values[i][indices], label=environment, color=color, linewidth=linewidth, marker='x')
 
-        ax[2].set_title('Environment')
-        ax[2].set_xlabel('Top-$k$ (%)')
-        # ax[2].set_xscale('log')
-        # ax[2].set_yscale('log')
-        ax[2].set_ylabel('')
+        ax[1].set_title('Environment')
+        ax[1].set_xlabel('Top-$k$ (%)')
+        # ax[1].set_xscale('log')
+        # ax[1].set_yscale('log')
+        ax[1].set_ylabel('')
 
-        ax[2].legend(fontsize=0.7*SMALL_SIZE, ncols=2)
+        ax[1].legend(fontsize=0.7*SMALL_SIZE, ncols=2)
 
         ax[0].set_ylim(0, 1)
         ax[1].set_ylim(0, 1)
-        ax[2].set_ylim(0, 1)
 
         # hide y axis numbers
         ax[1].get_yaxis().set_visible(False)
-        ax[2].get_yaxis().set_visible(False)
 
         ax[0].spines[['right', 'top']].set_visible(False)
         ax[1].spines[['right', 'top']].set_visible(False)
-        ax[2].spines[['right', 'top']].set_visible(False)
 
         fig.tight_layout()
 
@@ -4088,10 +4055,13 @@ def principle1_run_configured_experiments(experiments, output_dir, default_tempe
         cot_existing = [f for f in cot_outfiles if os.path.exists(f)]
         for missing in sorted((set(non_cot_outfiles) | set(cot_outfiles)) - (set(non_cot_existing) | set(cot_existing))):
             print(f'Skipping multi-LLM analysis input {missing}: file does not exist.')
-        if non_cot_existing:
-            principle1_analyze_experiments_multiple_llms(non_cot_existing)
-        if cot_existing:
-            principle1_analyze_experiments_multiple_llms(cot_existing, sfx='_cot')
+        # Single unified comparison: CoT runs are merged in so the baseline
+        # model's CoT variant shows up as its own bar in the Model panel
+        # (labelled '... -CoT'); CoT records are excluded from the Environment
+        # panel because that panel filters on the non-CoT baseline label.
+        comparison_existing = non_cot_existing + cot_existing
+        if comparison_existing:
+            principle1_analyze_experiments_multiple_llms(comparison_existing)
 
     return {
         'supported_models': supported_models,
