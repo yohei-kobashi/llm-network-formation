@@ -68,6 +68,23 @@ transformers_schema_warning_models = set()
 transformers_unavailable_models = set()
 hf_clients = {}
 
+
+class ModelUnavailableError(RuntimeError):
+    """Raised when a local model can run in neither vLLM nor the Transformers
+    fallback. Experiments must skip the model instead of retrying: every
+    request would return None, and the run would write records whose graphs
+    have no edges (which then poison resume/skip logic and analysis)."""
+
+
+def _raise_if_model_unusable(model):
+    if model in vllm_unavailable_models and model in transformers_unavailable_models:
+        detail = f" vLLM import error: {vllm_import_error}." if vllm_import_error else ""
+        raise ModelUnavailableError(
+            f"{model} cannot run in this runtime: vLLM failed to import/load and the "
+            f"Transformers fallback also failed.{detail} In Colab, re-run the setup cell "
+            f"and let it restart the runtime, then run the notebook again."
+        )
+
 SHARED_BASELINE_MODEL = 'Qwen/Qwen3.5-4B'
 SHARED_MODEL_NAMES = [
     'gpt-5-nano',
@@ -735,15 +752,20 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
 
         return result.content[0].text
     elif model.startswith('Qwen/'):
+        _raise_if_model_unusable(model)
         if model in vllm_unavailable_models:
-            return _try_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+            answer = _try_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+            _raise_if_model_unusable(model)
+            return answer
         try:
             return _get_vllm_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
         except Exception as e:
             vllm_unavailable_models.add(model)
             print(f"[vLLM fallback] {model} failed to load or generate with vLLM: {str(e).splitlines()[0]}")
             print(f"[vLLM fallback] Retrying {model} with Transformers.")
-            return _try_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+            answer = _try_transformers_response(prompt, model, temperature, system_prompt, response_schema=response_schema, cot=cot, cot_config=cot_config)
+            _raise_if_model_unusable(model)
+            return answer
     else:
         global replicate_client
         replicate_input = {
@@ -759,15 +781,20 @@ def get_response(prompt, model, temperature=0.9, system_prompt="You are mimickin
 
 def get_responses(prompts, model, temperature=0.9, system_prompt="You are mimicking a real-life person who wants to make friends.", response_schemas=None, cot=False, cot_config=None):
     if model.startswith('Qwen/'):
+        _raise_if_model_unusable(model)
         if model in vllm_unavailable_models:
-            return _try_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+            answers = _try_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+            _raise_if_model_unusable(model)
+            return answers
         try:
             return _get_vllm_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
         except Exception as e:
             vllm_unavailable_models.add(model)
             print(f"[vLLM fallback] {model} failed to load or generate with vLLM: {str(e).splitlines()[0]}")
             print(f"[vLLM fallback] Retrying {model} with Transformers.")
-            return _try_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+            answers = _try_transformers_responses(prompts, model, temperature, system_prompt, response_schemas=response_schemas, cot=cot, cot_config=cot_config)
+            _raise_if_model_unusable(model)
+            return answers
 
     if response_schemas is None:
         response_schemas = [None] * len(prompts)
@@ -1031,6 +1058,8 @@ def build_acceptance_response_schema():
 
 
 def _clean_model_json_text(text):
+    if text is None:
+        raise ValueError('no response text (generation failed or returned None)')
     text = text.strip()
     if 'FINAL_JSON:' in text:
         text = text.rsplit('FINAL_JSON:', 1)[1].strip()
@@ -2223,7 +2252,11 @@ def principle2_get_table(filenames, sfx='', environments=True, transitivity_null
 
     baseline_model_key = baseline_model_name.replace('/', '-')
     baseline_model = rename_models.get(baseline_model_key, baseline_model_key)
-    default_temperature = df[df['Temperature'].notna()]['Temperature'].iloc[0]
+    temperatures_present = df[df['Temperature'].notna()]['Temperature']
+    if temperatures_present.empty:
+        print('Skipping multi-LLM plots: no records with a temperature value.')
+        return
+    default_temperature = temperatures_present.iloc[0]
 
     df_model = df.query('Environment == "Baseline" and Temperature == @default_temperature')
     df_environment = df.query('Model == @baseline_model')
@@ -2690,23 +2723,30 @@ def principle2_run_configured_experiments(experiments, output_dir, default_tempe
                 batch_groups[batch_key].append(record)
                 continue
 
-            principle2_run_network_formation_experiment(
-                outfile=record['outfile'],
-                method=record['method'],
-                model=record['model'],
-                environment=record['environment'],
-                role=record['role'],
-                num_common_neighbors=record['num_common_neighbors'],
-                cot=record['cot'],
-                cot_config=record.get('cot_config'),
-                temperatures=record['temperatures'],
-                er=record['er'],
-                metadata=record['metadata'],
-                **record['parameters'],
-            )
+            try:
+                principle2_run_network_formation_experiment(
+                    outfile=record['outfile'],
+                    method=record['method'],
+                    model=record['model'],
+                    environment=record['environment'],
+                    role=record['role'],
+                    num_common_neighbors=record['num_common_neighbors'],
+                    cot=record['cot'],
+                    cot_config=record.get('cot_config'),
+                    temperatures=record['temperatures'],
+                    er=record['er'],
+                    metadata=record['metadata'],
+                    **record['parameters'],
+                )
+            except ModelUnavailableError as e:
+                print(f'Skipping experiment {record["metadata"]["experiment_name"]}: {e}')
 
         for records in batch_groups.values():
-            principle2_run_network_formation_experiments_batch(records)
+            try:
+                principle2_run_network_formation_experiments_batch(records)
+            except ModelUnavailableError as e:
+                names = ', '.join(r['metadata']['experiment_name'] for r in records)
+                print(f'Skipping batched experiments ({names}): {e}')
 
     if run_analysis:
         for record in experiments_to_analyze:
@@ -3007,6 +3047,20 @@ def principle1_build_neighbor_request(candidates, candidate_idx, environment, ro
         'hash_and_shuffle': hash_and_shuffle,
     }
 
+def principle1_record_has_any_edge(record):
+    """A saved record with zero successful edges (every LLM call failed) is
+    garbage: treat it as NOT completed so the simulation is re-run on resume,
+    instead of being skipped forever."""
+    history = record.get('edge_history')
+    if history is not None:
+        return any(selected is not None for _, selected in history)
+    graphs = record.get('graphs')
+    if graphs:
+        last = graphs[-1]
+        if isinstance(last, dict):
+            return any(neighbors for neighbors in last.values())
+    return False
+
 def principle1_parse_neighbor_response(ans, request):
     candidate_names = request['candidate_names']
     result = first_json_object(ans)
@@ -3097,6 +3151,9 @@ def principle1_pending_growth_states_for_experiment(experiment_record):
             lines = f.read().splitlines()
         for line in lines:
             scenario = json.loads(line)
+            if not principle1_record_has_any_edge(scenario):
+                print(f'Ignoring saved simulation with no edges (n={scenario["n"]}, simulation={scenario["simulation"]}, temperature={scenario["temperature"]}); it will be re-run.')
+                continue
             saved_scenarios.add((scenario['n'], scenario['simulation'], scenario['temperature']))
 
     print(f'Loaded {len(saved_scenarios)} completed simulations from {outfile}')
@@ -3220,6 +3277,9 @@ def principle1_run_network_formation_experiment(n_min, n_max, n_step, num_simula
 
         for line in lines:
             scenario = json.loads(line)
+            if not principle1_record_has_any_edge(scenario):
+                print(f'Ignoring saved simulation with no edges (n={scenario["n"]}, simulation={scenario["simulation"]}, temperature={scenario["temperature"]}); it will be re-run.')
+                continue
             saved_scenarios.add((scenario['n'], scenario['simulation'], scenario['temperature']))
 
     expected_scenarios = {
@@ -3344,6 +3404,10 @@ def principle1_analyze_experiments(filename, dgr=True):
     for line in lines:
         data.append(json.loads(line))
 
+    if not data:
+        print(f'Skipping analysis for {filename}: file has no records.')
+        return
+
     degree_freqs = collections.defaultdict(list)
     dergee_freqs_barabasi_albert = collections.defaultdict(list)
 
@@ -3362,6 +3426,10 @@ def principle1_analyze_experiments(filename, dgr=True):
 
     for d in data:
         Gs = principle1_reconstruct_graphs(d)
+
+        if not Gs or Gs[-1].number_of_nodes() == 0:
+            print(f'Skipping record (n={d["n"]}, simulation={d["simulation"]}, temperature={d["temperature"]}): final graph has no edges (all LLM calls failed).')
+            continue
 
         final_graphs[d['n'], d['temperature']].append((Gs[-1].copy(), Gs[0].copy()))
 
@@ -3603,6 +3671,10 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
 
             records.append(record)
 
+    if not records:
+        print(f'Skipping multi-LLM analysis{sfx or ""}: no usable records (all simulations were empty or missing).')
+        return
+
     G_barabasi_albert = nx.barabasi_albert_graph(n=d['n'], m=1, seed=1)
     degrees_barabasi_albert = [G_barabasi_albert.degree(n) for n in G_barabasi_albert.nodes()]
     powerlaw_fit = pwl.Fit(degrees_barabasi_albert, discrete=True)
@@ -3655,7 +3727,11 @@ def principle1_analyze_experiments_multiple_llms(filenames, sfx=''):
 
     baseline_model_key = PRINCIPLE1_BASELINE_MODEL.replace('/', '-')
     baseline_model = rename_models.get(baseline_model_key, baseline_model_key)
-    default_temperature = df[df['Temperature'].notna()]['Temperature'].iloc[0]
+    temperatures_present = df[df['Temperature'].notna()]['Temperature']
+    if temperatures_present.empty:
+        print(f'Skipping multi-LLM plots{sfx or ""}: no records with a temperature value (only the Barabasi-Albert reference remained).')
+        return
+    default_temperature = temperatures_present.iloc[0]
 
     df_model = df.query('Environment == "Baseline" and Temperature == @default_temperature')
     df_model = df_model[df_model['Model'] != 'Barabasi-Albert']
@@ -3977,31 +4053,45 @@ def principle1_run_configured_experiments(experiments, output_dir, default_tempe
                 batch_groups[batch_key].append(record)
                 continue
 
-            principle1_run_network_formation_experiment(
-                **record['parameters'],
-                outfile=record['outfile'],
-                temperatures=record['temperatures'],
-                environment=record['environment'],
-                role=record['role'],
-                degrees=record['degrees'],
-                model=record['model'],
-                cot=record['cot'],
-                cot_config=record.get('cot_config'),
-                hash_and_shuffle=record['hash_and_shuffle'],
-                metadata=record['metadata'],
-            )
+            try:
+                principle1_run_network_formation_experiment(
+                    **record['parameters'],
+                    outfile=record['outfile'],
+                    temperatures=record['temperatures'],
+                    environment=record['environment'],
+                    role=record['role'],
+                    degrees=record['degrees'],
+                    model=record['model'],
+                    cot=record['cot'],
+                    cot_config=record.get('cot_config'),
+                    hash_and_shuffle=record['hash_and_shuffle'],
+                    metadata=record['metadata'],
+                )
+            except ModelUnavailableError as e:
+                print(f'Skipping experiment {record["metadata"]["experiment_name"]}: {e}')
 
         for records in batch_groups.values():
-            principle1_run_network_formation_experiments_batch(records)
+            try:
+                principle1_run_network_formation_experiments_batch(records)
+            except ModelUnavailableError as e:
+                names = ', '.join(r['metadata']['experiment_name'] for r in records)
+                print(f'Skipping batched experiments ({names}): {e}')
 
     if run_analysis:
         for record in experiments_to_analyze:
+            if not os.path.exists(record['outfile']):
+                print(f'Skipping analysis for {record["outfile"]}: file does not exist (experiment skipped or not run).')
+                continue
             principle1_analyze_experiments(record['outfile'], dgr=not record['degrees'])
 
-        if non_cot_outfiles:
-            principle1_analyze_experiments_multiple_llms(non_cot_outfiles)
-        if cot_outfiles:
-            principle1_analyze_experiments_multiple_llms(cot_outfiles, sfx='_cot')
+        non_cot_existing = [f for f in non_cot_outfiles if os.path.exists(f)]
+        cot_existing = [f for f in cot_outfiles if os.path.exists(f)]
+        for missing in sorted((set(non_cot_outfiles) | set(cot_outfiles)) - (set(non_cot_existing) | set(cot_existing))):
+            print(f'Skipping multi-LLM analysis input {missing}: file does not exist.')
+        if non_cot_existing:
+            principle1_analyze_experiments_multiple_llms(non_cot_existing)
+        if cot_existing:
+            principle1_analyze_experiments_multiple_llms(cot_existing, sfx='_cot')
 
     return {
         'supported_models': supported_models,
@@ -5419,23 +5509,30 @@ def principle3_run_configured_experiments(experiments, output_dir, default_tempe
                 batch_groups[batch_key].append(record)
                 continue
 
-            principle3_run_network_formation_experiment(
-                outfile=record['outfile'],
-                method=record['method'],
-                model=record['model'],
-                environment=record['environment'],
-                role=record['role'],
-                cot=record['cot'],
-                cot_config=record.get('cot_config'),
-                profiles_filename=record['profiles_filename'],
-                mutual_acceptance=record['mutual_acceptance'],
-                temperatures=record['temperatures'],
-                metadata=record['metadata'],
-                **record['parameters'],
-            )
+            try:
+                principle3_run_network_formation_experiment(
+                    outfile=record['outfile'],
+                    method=record['method'],
+                    model=record['model'],
+                    environment=record['environment'],
+                    role=record['role'],
+                    cot=record['cot'],
+                    cot_config=record.get('cot_config'),
+                    profiles_filename=record['profiles_filename'],
+                    mutual_acceptance=record['mutual_acceptance'],
+                    temperatures=record['temperatures'],
+                    metadata=record['metadata'],
+                    **record['parameters'],
+                )
+            except ModelUnavailableError as e:
+                print(f'Skipping experiment {record["metadata"]["experiment_name"]}: {e}')
 
         for records in batch_groups.values():
-            principle3_run_network_formation_experiments_batch(records)
+            try:
+                principle3_run_network_formation_experiments_batch(records)
+            except ModelUnavailableError as e:
+                names = ', '.join(r['metadata']['experiment_name'] for r in records)
+                print(f'Skipping batched experiments ({names}): {e}')
 
     if run_analysis:
         for record in experiments_to_analyze:
@@ -6708,21 +6805,28 @@ def principle5_run_configured_experiments(experiments, output_dir, default_tempe
                 batch_groups[batch_key].append(record)
                 continue
 
-            principle5_run_network_formation_experiment(
-                outfile=record['outfile'],
-                temperatures=record['temperatures'],
-                environment=record['environment'],
-                role=record['role'],
-                method=record['method'],
-                model=record['model'],
-                cot=record['cot'],
-                cot_config=record.get('cot_config'),
-                metadata=record['metadata'],
-                **record['parameters'],
-            )
+            try:
+                principle5_run_network_formation_experiment(
+                    outfile=record['outfile'],
+                    temperatures=record['temperatures'],
+                    environment=record['environment'],
+                    role=record['role'],
+                    method=record['method'],
+                    model=record['model'],
+                    cot=record['cot'],
+                    cot_config=record.get('cot_config'),
+                    metadata=record['metadata'],
+                    **record['parameters'],
+                )
+            except ModelUnavailableError as e:
+                print(f'Skipping experiment {record["metadata"]["experiment_name"]}: {e}')
 
         for records in batch_groups.values():
-            principle5_run_network_formation_experiments_batch(records)
+            try:
+                principle5_run_network_formation_experiments_batch(records)
+            except ModelUnavailableError as e:
+                names = ', '.join(r['metadata']['experiment_name'] for r in records)
+                print(f'Skipping batched experiments ({names}): {e}')
 
     if run_analysis:
         for record in experiments_to_analyze:
