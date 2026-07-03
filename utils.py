@@ -8080,7 +8080,7 @@ def combined_generate_regression_table(filename, outfile, bias=True, log_transfo
         for num_features in range(len(feature_names) + 1):
             for feature_combination in itertools.combinations(feature_names, num_features):
                 feature_combination = list(feature_combination)
-                theta, standard_errors, log_likelihood, _, probabilities, ame, sdame = dcm.fit_discrete_choice_model((d['results'], d['candidates']), feature_names=feature_combination, bias=bias, log_transform=log_transform, exclude_log=exclude_log, calculate_p_values=True, calculate_average_marginal_effects=True, input_type='results_candidates')
+                theta, standard_errors, log_likelihood, _, probabilities, ame, sdame, _ = dcm.fit_discrete_choice_model((d['results'], d['candidates']), feature_names=feature_combination, bias=bias, log_transform=log_transform, exclude_log=exclude_log, calculate_p_values=True, calculate_average_marginal_effects=True, input_type='results_candidates')
 
 
                 temp = {
