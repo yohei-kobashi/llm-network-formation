@@ -2905,8 +2905,7 @@ def principle3_write_markdown_report(
                 lines = f.read().splitlines()
             for line in lines:
                 d = json.loads(line)
-                G = nx.from_dict_of_dicts(d['graphs'][-1])
-                nx.set_node_attributes(G, profiles_dict)
+                G = principle3_graph_from_stored(d['graphs'][-1], profiles_dict)
                 G.remove_edges_from(nx.selfloop_edges(G))
                 G.remove_nodes_from(list(nx.isolates(G)))
 
@@ -4751,6 +4750,39 @@ def principle3_profile_set(p):
 
     return set(temp)
 
+
+def principle3_graph_from_stored(graph, profiles_dict=None):
+    """Reconstruct a stored principle 3 graph, tolerating both the dict-of-dicts
+    ({node: {neighbor: {attrs}}}) and the older dict-of-lists ({node: [neighbors]})
+    serializations. Node ids are normalized to strings to match the profile keys.
+
+    When ``profiles_dict`` is given, node attributes are set from it and every edge
+    is guaranteed a ``similarity`` attribute (recomputed from the profiles when the
+    stored graph did not carry edge attributes)."""
+    G = nx.Graph()
+    for node, neighbors in graph.items():
+        node = str(node)
+        G.add_node(node)
+        if isinstance(neighbors, dict):
+            for neighbor, attrs in neighbors.items():
+                G.add_edge(node, str(neighbor), **(attrs if isinstance(attrs, dict) else {}))
+        else:
+            for neighbor in neighbors:
+                G.add_edge(node, str(neighbor))
+
+    if profiles_dict is not None:
+        nx.set_node_attributes(G, profiles_dict)
+        for u, v, data in G.edges(data=True):
+            if 'similarity' not in data:
+                profile_u = profiles_dict.get(u)
+                profile_v = profiles_dict.get(v)
+                if profile_u is not None and profile_v is not None:
+                    data['similarity'] = len(
+                        principle3_profile_set(profile_u) & principle3_profile_set(profile_v))
+
+    return G
+
+
 def principle3_build_selection_request(G, t, profiles, environment, role, cot, model):
     candidate_profiles = []
     for v in G.nodes():
@@ -5010,7 +5042,7 @@ def principle3_write_growth_state(state):
         'n' : state['n'],
         'temperature' : state['temperature_label'],
         'simulation' : state['simulation'],
-        'graphs' : [nx.to_dict_of_lists(G) for G in state['graphs']],
+        'graphs' : [nx.to_dict_of_dicts(G) for G in state['graphs']],
         'reasons' : state['reasons'],
         'mutual_acceptance_probability' : mutual_acceptance_probability,
         'model' : state['model'],
@@ -5200,7 +5232,7 @@ def principle3_run_network_formation_experiment(n_min, n_max, n_step, num_simula
                         'n' : n,
                         'temperature' : temperature_label,
                         'simulation' : i,
-                        'graphs' : [nx.to_dict_of_lists(G) for G in Gs],
+                        'graphs' : [nx.to_dict_of_dicts(G) for G in Gs],
                         'reasons' : reasons,
                         'mutual_acceptance_probability' : mutual_acceptance_probability,
                         'model' : model,
@@ -5295,9 +5327,7 @@ def principle3_analyze_experiments(filename):
     for d in data:
         Gs = []
         for graph in d['graphs']:
-            G = nx.from_dict_of_dicts(graph)
-
-            nx.set_node_attributes(G, profiles_dict)
+            G = principle3_graph_from_stored(graph, profiles_dict)
 
             G.remove_edges_from(nx.selfloop_edges(G))
             # G.remove_nodes_from(list(nx.isolates(G)))
@@ -5650,9 +5680,7 @@ def principle3_get_table(filenames, sfx='', attributes=['Location', 'Favorite Co
 
             Gs = []
             for graph in d['graphs']:
-                G = nx.from_dict_of_dicts(graph)
-
-                nx.set_node_attributes(G, profiles_dict)
+                G = principle3_graph_from_stored(graph, profiles_dict)
 
                 G.remove_edges_from(nx.selfloop_edges(G))
                 G.remove_nodes_from(list(nx.isolates(G)))
