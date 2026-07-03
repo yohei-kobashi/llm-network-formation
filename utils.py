@@ -3,6 +3,7 @@ import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import glob
 import json
 import random
 import os
@@ -7455,7 +7456,73 @@ COMBINED_RENAME_MODELS = {
     'Qwen-Qwen3.5-4B-thinking+link_prediction' : 'Qwen 3.5 4B (thinking)',
 }
 
-def combined_network_growth(G0, temperature=None, name='', num_choices=1, method='llm', num_samples=-1, num_nodes_samples=-1, model='gpt-5-mini', sampling_strategy='random', cot=False, cot_config=None):
+def _combined_checkpoint_path(outfile, ego, simulation, temperature_label, num_samples, num_choices):
+    stem = os.path.splitext(outfile)[0]
+
+    def safe(value):
+        return str(value).replace('/', '-').replace('.', 'p')
+
+    return f'{stem}.ckpt.ego{safe(ego)}.sim{simulation}.temp{safe(temperature_label)}.ns{num_samples}.nc{num_choices}.checkpoint.json'
+
+
+def _combined_serialize_rng():
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    return {
+        'py': [py_state[0], list(py_state[1]), py_state[2]],
+        'np': [np_state[0], [int(x) for x in np_state[1]], int(np_state[2]), int(np_state[3]), float(np_state[4])],
+    }
+
+
+def _combined_restore_rng(state):
+    if not state:
+        return
+    py_state = state.get('py')
+    if py_state:
+        random.setstate((py_state[0], tuple(py_state[1]), py_state[2]))
+    np_state = state.get('np')
+    if np_state:
+        np.random.set_state((np_state[0], np.array(np_state[1], dtype=np.uint32), np_state[2], np_state[3], np_state[4]))
+
+
+def _combined_save_checkpoint(path, next_index, results, candidates):
+    """Atomically persist mid-simulation progress so an interrupted run can resume."""
+    payload = {
+        'next_index': next_index,
+        'results': results,
+        'candidates': candidates,
+        'rng': _combined_serialize_rng(),
+    }
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(payload, f)
+        f.flush()
+    os.replace(tmp, path)
+
+
+def _combined_load_checkpoint(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f'Ignoring unreadable checkpoint {path}: {e}')
+        return None
+
+
+def _combined_remove_checkpoint(path):
+    if path and os.path.exists(path):
+        os.remove(path)
+
+
+def _combined_remove_all_checkpoints(outfile):
+    stem = os.path.splitext(outfile)[0]
+    for path in glob.glob(f'{stem}.ckpt.*.checkpoint.json'):
+        os.remove(path)
+
+
+def combined_network_growth(G0, temperature=None, name='', num_choices=1, method='llm', num_samples=-1, num_nodes_samples=-1, model='gpt-5-mini', sampling_strategy='random', cot=False, cot_config=None, checkpoint_path=None, checkpoint_every=25):
     # Set seed
     random.seed(0)
     np.random.seed(0)
@@ -7481,7 +7548,7 @@ def combined_network_growth(G0, temperature=None, name='', num_choices=1, method
 
         nodes = random.sample(list(G.nodes()), num_nodes_samples)
     else:
-        nodes = G.nodes()
+        nodes = list(G.nodes())
 
 
     # Drop one neighbor for each node
@@ -7503,8 +7570,25 @@ def combined_network_growth(G0, temperature=None, name='', num_choices=1, method
     results = []
     candidates = []
 
+    # Resume from a checkpoint if one exists: the deterministic setup above
+    # reproduces the same node order, dropped edges and link predictor, so we
+    # only need to replay the recorded edges, restore the RNG state, and continue
+    # from the next unprocessed node.
+    start_index = 0
+    if checkpoint_path and method == 'llm':
+        checkpoint = _combined_load_checkpoint(checkpoint_path)
+        if checkpoint is not None:
+            start_index = checkpoint['next_index']
+            results = checkpoint['results']
+            candidates = checkpoint['candidates']
+            for saved_result in results:
+                for r in saved_result:
+                    G.add_edge(*r['edge'], similarity=r['similarity'])
+            _combined_restore_rng(checkpoint.get('rng'))
+            print(f'Resuming {os.path.basename(checkpoint_path)} from node {start_index}/{len(nodes)}')
 
-    for i, t in enumerate(nodes):
+    for i in range(start_index, len(nodes)):
+        t = nodes[i]
 
         if method == 'llm':
             print('{}/{}'.format(i + 1, len(nodes)))
@@ -7560,6 +7644,11 @@ def combined_network_growth(G0, temperature=None, name='', num_choices=1, method
             print(f'Node: {t}, Links: {result}, Candidates: {candidate}')
 
         Gs.append(G.copy())
+
+        # Periodically persist progress so a disconnect only loses the last few
+        # nodes instead of the whole ego.
+        if checkpoint_path and method == 'llm' and (i + 1) % checkpoint_every == 0 and (i + 1) < len(nodes):
+            _combined_save_checkpoint(checkpoint_path, i + 1, results, candidates)
 
     return Gs, results, candidates
 
@@ -7748,6 +7837,9 @@ def combined_run_network_formation_experiment(name, num_simulations, outfile, te
 
     os.makedirs(os.path.dirname(outfile), exist_ok=True)
     maybe_reset_outfile(outfile)
+    if IGNORE_EXISTING_OUTPUTS:
+        # Reset mode regenerates from zero, so discard any stale resume checkpoints.
+        _combined_remove_all_checkpoints(outfile)
 
     saved_scenarios = set()
 
@@ -7778,13 +7870,15 @@ def combined_run_network_formation_experiment(name, num_simulations, outfile, te
         for i in range(num_simulations):
             for temperature in temperatures:
                 temperature_label = 'default' if temperature is None else temperature
+                checkpoint_path = _combined_checkpoint_path(outfile, ego, i, temperature_label, num_samples, num_choices)
                 if (name, ego, i, temperature_label, num_samples, num_choices) in saved_scenarios:
                     print(f'Skipping simulation for name={name}, ego={ego}, i={i}, temperature={temperature_label}, num_choices={num_choices}, num_samples={num_samples}, method={method}')
+                    _combined_remove_checkpoint(checkpoint_path)
                     continue
                 else:
                     print(f'Running simulation for name={name}, ego={ego}, i={i}, temperature={temperature_label}, num_choices={num_choices}, num_samples={num_samples}, method={method}')
 
-                    Gs, results, candidates = combined_network_growth(G0, temperature=temperature, method=method, name=name, num_choices=num_choices, num_samples=num_samples, num_nodes_samples=num_nodes_samples, model=model, sampling_strategy=sampling_strategy, cot=cot, cot_config=cot_config)
+                    Gs, results, candidates = combined_network_growth(G0, temperature=temperature, method=method, name=name, num_choices=num_choices, num_samples=num_samples, num_nodes_samples=num_nodes_samples, model=model, sampling_strategy=sampling_strategy, cot=cot, cot_config=cot_config, checkpoint_path=checkpoint_path)
 
                     temp = {
                         'name' : name,
@@ -7803,6 +7897,8 @@ def combined_run_network_formation_experiment(name, num_simulations, outfile, te
 
                     f.write(json.dumps(temp) + '\n')
                     f.flush()
+                    # The scenario is now recorded in the outfile; drop its checkpoint.
+                    _combined_remove_checkpoint(checkpoint_path)
 
                 if method != 'llm':
                     break
