@@ -5912,7 +5912,7 @@ def principle3_get_table(filenames, sfx='', attributes=['Location', 'Favorite Co
         ax[0, i].set_title(attribute)
 
 
-    for i in range(1 + len(attributes) + int(mutual_acceptance)):
+    for i in range(int(communities) + len(attributes) + int(mutual_acceptance)):
         for j in range(1 + int(environments)):
             ax[j, i].legend().set_visible(False)
 
