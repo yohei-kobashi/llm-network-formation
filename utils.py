@@ -4636,7 +4636,12 @@ def set_principle3_runtime_options(default_profiles_filename='profiles.jsonl', l
     plt.rc('figure', titlesize=BIGGER_SIZE)
 
 
-def principle3_generate_individuals(n):
+def principle3_generate_individuals(n, filename=None, seed=None, lucky_number=False):
+    if filename is None:
+        filename = PRINCIPLE3_DEFAULT_PROFILES_FILENAME
+
+    rng = random.Random(seed) if seed is not None else random
+
     profiles = []
 
     hobbies = ['reading', 'writing', 'cooking']
@@ -4644,18 +4649,44 @@ def principle3_generate_individuals(n):
 
     locations = ['New York City', 'Boston', 'Washington DC']
 
+    lucky_numbers = [1, 2, 3, 4, 5, 6, 7]
+
     for i in range(n):
         profile = {
             'name' : i,
-            'hobby' : random.choice(hobbies),
-            'favorite color' : random.choice(colors),
-            'location' : random.choice(locations)
+            'hobby' : rng.choice(hobbies),
+            'favorite color' : rng.choice(colors),
+            'location' : rng.choice(locations)
         }
+
+        if lucky_number:
+            profile['lucky number'] = rng.choice(lucky_numbers)
 
         profiles.append(profile)
 
-    with open(PRINCIPLE3_DEFAULT_PROFILES_FILENAME, 'w+') as f:
+    directory = os.path.dirname(filename)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(filename, 'w+') as f:
         [f.write(json.dumps(profile) + '\n') for profile in profiles]
+
+    return filename
+
+
+def principle3_ensure_profiles(profiles_filename, n, lucky_number=False, seed=0):
+    """Generate the profiles file if it is missing (or has fewer than ``n``
+    profiles), so a fresh Google Drive output directory does not crash the
+    experiments. Existing files are left untouched to keep results reproducible."""
+    if os.path.exists(profiles_filename):
+        with open(profiles_filename) as f:
+            existing = [line for line in f.read().splitlines() if line.strip()]
+        if len(existing) >= n:
+            return profiles_filename
+
+    principle3_generate_individuals(n, filename=profiles_filename, seed=seed, lucky_number=lucky_number)
+    print(f'Generated {n} profiles{" with lucky number" if lucky_number else ""} -> {profiles_filename}')
+    return profiles_filename
 
 def principle3_network_growth(n0, temperature=None, model='gpt-5-mini', environment=None, role='friends', method='llm', cot=False, cot_config=None, profiles_filename=None, mutual_acceptance=False):
     if profiles_filename is None:
@@ -6003,6 +6034,21 @@ def principle3_run_configured_experiments(experiments, output_dir, default_tempe
 
         if experiment.get('analyze_detail', False):
             experiments_to_analyze.append(record)
+
+    # Generate any missing profiles files (e.g. on a fresh Google Drive output
+    # directory) so both the experiments and the analysis can read them.
+    if experiment_records:
+        profiles_max_n = max(
+            (record['parameters'].get('n_max', 50) for record in experiment_records),
+            default=50,
+        )
+        lucky_basename = os.path.basename(PRINCIPLE3_LUCKY_NUMBER_PROFILES_FILENAME)
+        for profiles_filename in sorted({record['profiles_filename'] for record in experiment_records}):
+            principle3_ensure_profiles(
+                profiles_filename,
+                profiles_max_n,
+                lucky_number=os.path.basename(profiles_filename) == lucky_basename,
+            )
 
     if run_experiments:
         for record in experiment_records:
