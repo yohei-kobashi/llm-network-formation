@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import json
 import random
 import os
