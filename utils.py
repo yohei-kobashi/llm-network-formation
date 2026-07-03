@@ -5462,7 +5462,8 @@ def principle3_analyze_experiments(filename):
 
     fig.savefig('figures/principle_3/principle_3_profiles_overall.pdf')
 
-    fig, ax = plt.subplots(1, len(final_graphs), figsize=(5 * (len(final_graphs)), 5))
+    fig, ax = plt.subplots(1, len(final_graphs), figsize=(5 * (len(final_graphs)), 5), squeeze=False)
+    ax = ax[0]
 
     for i, (k, v) in enumerate(sorted(final_graphs.items())):
         G = v[0][0]
