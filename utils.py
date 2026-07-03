@@ -7662,7 +7662,12 @@ def combined_build_selection_request(G, t, profiles, num_choices=1, num_samples=
     ```json
     """
 
-    return {'prompt': prompt, 'candidate_profiles': candidate_profiles, 'num_choices': num_choices, 'response_schema': None}
+    candidate_names = [candidate_profile['name'] for candidate_profile in candidate_profiles]
+    # Constrain Qwen's structured-output decoding to the offered candidates, the
+    # same way principle_2 does. Skipped when no selection is expected.
+    response_schema = build_response_list_schema(candidate_names, max_items=num_choices) if num_choices > 0 else None
+
+    return {'prompt': prompt, 'candidate_profiles': candidate_profiles, 'candidate_names': candidate_names, 'num_choices': num_choices, 'response_schema': response_schema}
 
 
 def combined_parse_selection_response(ans):
@@ -7687,13 +7692,18 @@ def combined_select_neighbor(G, t, profiles, temperature=None, num_choices=1, nu
     request = combined_build_selection_request(G, t, profiles, num_choices=num_choices, num_samples=num_samples, dropped_nodes=dropped_nodes, model=model, sampling_strategy=sampling_strategy, sk_model=sk_model)
     candidate_profiles = request['candidate_profiles']
 
-    for attempt in range(3 if cot else 1):
+    # Mirror principle_2's Qwen vLLM inference: structured-output decoding except
+    # for Qwen chain-of-thought, up to 3 attempts, disabling thinking on retry.
+    use_structured_output = not (model.startswith('Qwen/') and cot)
+    response_schema = request['response_schema'] if use_structured_output else None
+
+    for attempt in range(3):
         ans = None
         try:
             attempt_cot_config = retry_cot_config(cot_config, attempt) if cot else cot_config
             if cot and attempt_cot_config and attempt_cot_config != cot_config:
                 print(f'Retrying with qwen_enable_thinking={attempt_cot_config.get("qwen_enable_thinking")}, max_new_tokens={attempt_cot_config.get("max_new_tokens")}')
-            ans = get_response(request['prompt'], temperature=temperature, model=model, cot=cot, cot_config=attempt_cot_config)
+            ans = get_response(request['prompt'], model, temperature=temperature, system_prompt="You are a helpful assistant", response_schema=response_schema, cot=cot, cot_config=attempt_cot_config)
             results = combined_parse_selection_response(ans)
 
             filtered_results = []
@@ -7701,9 +7711,20 @@ def combined_select_neighbor(G, t, profiles, temperature=None, num_choices=1, nu
                 v = result['name']
                 if v in G.nodes():
                     result['similarity'] = combined_measure_similarity(profiles[t], profiles[v])
+                    result['dropped'] = v in dropped_nodes
                     filtered_results.append(result)
 
-                    result['dropped'] = v in dropped_nodes
+            # Strict acceptance like principle_2: if a selection was requested but no
+            # valid candidate came back (e.g. a truncated CoT output), treat it as a
+            # parse failure so the retry fires instead of silently recording nothing.
+            if num_choices > 0 and not filtered_results:
+                raise ValueError(f'No valid candidate selected among {request["candidate_names"]!r}')
+
+            if attempt > 0:
+                for result in filtered_results:
+                    result['retry_attempt'] = attempt + 1
+                    if attempt_cot_config and 'max_new_tokens' in attempt_cot_config:
+                        result['retry_max_new_tokens'] = attempt_cot_config['max_new_tokens']
 
             print(f'Node: {t}, Links: {filtered_results}')
 
@@ -7715,7 +7736,7 @@ def combined_select_neighbor(G, t, profiles, temperature=None, num_choices=1, nu
 
             return filtered_results, candidates
         except Exception as e:
-            print('error', e)
+            print_llm_parse_error(e, ans, context=f'combined_select_neighbor attempt={attempt + 1}, node={t}, model={model}')
 
     return [], []
 
