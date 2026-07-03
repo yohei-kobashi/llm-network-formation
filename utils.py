@@ -8059,6 +8059,10 @@ def combined_generate_regression_table(filename, outfile, bias=True, log_transfo
 
     palette = ['#d35400', '#34495e', '#2980b9', '#e67e22', '#f1c40f', '#7f8c8d', '#27ae60', '#16a085', '#bdc3c7', '#1abc9c', '#2ecc71', '#3498db', '#9b59b6', '#8e44ad', '#ecf0f1']
 
+    if not os.path.exists(filename):
+        print(f'Skipping regression table for missing file {filename}.')
+        return
+
     with open(filename) as f:
         lines = f.read().splitlines()
 
@@ -8447,6 +8451,10 @@ def combined_build_graph_statistics_change_df(filenames, subgraph=False):
 
     for filename in filenames:
 
+            if not os.path.exists(filename):
+                print(f'Skipping graph-statistics for missing file {filename}.')
+                continue
+
             basename1 = filename.split('+')
 
             if len(basename1) == 3:
@@ -8528,6 +8536,10 @@ def combined_build_graph_statistics_change_df(filenames, subgraph=False):
 
 def combined_graph_statistics_change(filenames, outfile, subgraph=False):
     records_df = combined_build_graph_statistics_change_df(filenames, subgraph=subgraph)
+
+    if records_df is None or records_df.empty:
+        print(f'No graph-statistics records for {outfile}; skipping table.')
+        return
 
     with open(outfile, 'w') as f:
         f.write(records_df.to_latex(index=False, escape=True, column_format='lccccccccccc', float_format='%.1g'))
