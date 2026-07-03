@@ -2750,6 +2750,27 @@ def _write_markdown_report_file(output_dir, filename, title, sections, timestamp
     return output_path
 
 
+def _dataframe_to_markdown(df, float_fmt='{:.4g}'):
+    """Render a pandas DataFrame as a markdown table without depending on the
+    optional `tabulate` package."""
+    headers = [str(c) for c in df.columns]
+    lines = [
+        '| ' + ' | '.join(headers) + ' |',
+        '| ' + ' | '.join('---' for _ in headers) + ' |',
+    ]
+    for _, row in df.iterrows():
+        cells = []
+        for value in row:
+            if isinstance(value, float):
+                cells.append(float_fmt.format(value) if np.isfinite(value) else '—')
+            elif value is None:
+                cells.append('—')
+            else:
+                cells.append(str(value).replace('\n', ' '))
+        lines.append('| ' + ' | '.join(cells) + ' |')
+    return '\n'.join(lines)
+
+
 def principle1_write_markdown_report(
     run_results,
     output_dir,
@@ -8064,12 +8085,17 @@ def combined_compare_models(filenames1, filenames2, bias=True, log_transform=Tru
     fig.tight_layout()
     fig.savefig(outfile, bbox_inches='tight')
 
-def combined_pretty_print_regression_table(filenames, outfile, full=False):
-
+def combined_build_regression_table_df(filenames, full=False):
+    """Build the formatted regression-coefficient DataFrames (main + AME) shared by
+    the LaTeX and markdown regression-table writers."""
     if isinstance(filenames, str):
         filenames = [filenames]
 
-    regression_table_df = pd.concat([pd.read_excel(filename) for filename in filenames])
+    frames = [pd.read_excel(filename) for filename in filenames if os.path.exists(filename)]
+    if not frames:
+        return None, None
+
+    regression_table_df = pd.concat(frames)
 
     regression_table_df = regression_table_df.query('`Independent Variable` != "[]"')
 
@@ -8120,6 +8146,15 @@ def combined_pretty_print_regression_table(filenames, outfile, full=False):
     table_rows_ame_df = pd.DataFrame.from_records(table_rows_ame_df, columns=['Ego'] if ego_row else [] +  ['Temperature', 'Degree', 'Common attributes', 'Common neighbors'])
     table_rows_df = table_rows_df.fillna(' ')
     table_rows_ame_df = table_rows_ame_df.fillna(' ')
+
+    return table_rows_df, table_rows_ame_df
+
+
+def combined_pretty_print_regression_table(filenames, outfile, full=False):
+    table_rows_df, table_rows_ame_df = combined_build_regression_table_df(filenames, full=full)
+    if table_rows_df is None:
+        print(f'combined_pretty_print_regression_table: no input tables found for {outfile}.')
+        return
 
     table_rows_df.to_latex(outfile, index=False, escape=True, column_format='lcccccc')
 
@@ -8195,9 +8230,9 @@ def combined_small_worldness(filenames, name, dataloader_fn, subgraph=False):
 
                 print(f'{temp["name"]}, {temp["temperature"]}, Average Shortest Path Length Change: {average_shortest_path_length_initial_change}, Clustering Coefficient Change: {clustering_coefficient_initial_change}')
 
-def combined_graph_statistics_change(filenames, outfile, subgraph=False):
-
-
+def combined_build_graph_statistics_change_df(filenames, subgraph=False):
+    """Compute the per-graph statistics-change records shared by the LaTeX and
+    markdown writers."""
     records = []
 
     for filename in filenames:
@@ -8278,10 +8313,63 @@ def combined_graph_statistics_change(filenames, outfile, subgraph=False):
                     'Number of New Edges Added (%)' : number_of_new_edges_added,
                 })
 
-    records_df = pd.DataFrame.from_records(records)
+    return pd.DataFrame.from_records(records)
+
+
+def combined_graph_statistics_change(filenames, outfile, subgraph=False):
+    records_df = combined_build_graph_statistics_change_df(filenames, subgraph=subgraph)
 
     with open(outfile, 'w') as f:
         f.write(records_df.to_latex(index=False, escape=True, column_format='lccccccccccc', float_format='%.1g'))
+
+
+def combined_write_markdown_report(
+    output_dir,
+    regression_sections=None,
+    graph_stats_sections=None,
+    filename='combined_model_results.md',
+    title='Real-world Networks (Combined Model) — Results',
+    full=False,
+    timestamp=None,
+):
+    """Consolidate the combined-model results into a single markdown file written to
+    ``output_dir``.
+
+    ``regression_sections`` and ``graph_stats_sections`` are each a list of dicts:
+      - regression: ``{'label': str, 'xlsx_files': [...], 'full': bool (optional)}``
+        -> a discrete-choice regression-coefficient table (Degree, Common
+        attributes, Common neighbors, Log Likelihood, AIC).
+      - graph stats: ``{'label': str, 'jsonl_files': [...], 'subgraph': bool}``
+        -> a table of how graph statistics change from the initial to the final
+        network (KS statistics for degree / component sizes / spectrum / clustering
+        and the percentage of new edges added).
+
+    Missing input files are skipped, so the report reflects whatever has actually
+    been generated in this session."""
+    sections = []
+
+    for spec in (regression_sections or []):
+        xlsx_files = [f for f in spec.get('xlsx_files', []) if os.path.exists(f)]
+        if not xlsx_files:
+            continue
+        table_rows_df, _ = combined_build_regression_table_df(xlsx_files, full=spec.get('full', full))
+        if table_rows_df is None or table_rows_df.empty:
+            continue
+        sections.append(f'## Regression — {spec["label"]}')
+        sections.append(_dataframe_to_markdown(table_rows_df))
+
+    for spec in (graph_stats_sections or []):
+        jsonl_files = [f for f in spec.get('jsonl_files', []) if os.path.exists(f)]
+        if not jsonl_files:
+            continue
+        records_df = combined_build_graph_statistics_change_df(jsonl_files, subgraph=spec.get('subgraph', False))
+        if records_df is None or records_df.empty:
+            continue
+        sections.append(f'## Graph Statistics Change — {spec["label"]}')
+        sections.append(_dataframe_to_markdown(records_df))
+
+    return _write_markdown_report_file(output_dir, filename, title, sections, timestamp)
+
 
 def combined_measure_relative_increase(filenames):
 
