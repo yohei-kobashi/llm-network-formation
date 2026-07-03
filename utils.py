@@ -2109,13 +2109,12 @@ def principle2_analyze_experiments(filename, num_common_neighbors=True, er=False
 
     return transitivity_temp, probability_temp
 
-def principle2_get_table(filenames, sfx='', environments=True, transitivity_null=-1, probability_null=-1, er=False, baseline_model_name='Qwen/Qwen3.5-4B'):
-    os.makedirs('figures', exist_ok=True)
-    os.makedirs('tables', exist_ok=True)
-
+def principle2_build_summary_records(filenames, er=False):
+    """Read the per-simulation jsonl outfiles and compute the summary metrics
+    (Marginal Transitivity, Prob. of Edge within Community, Top-$k$ curves) for
+    each record. Shared by the plotting table and the markdown report so both
+    stay in sync."""
     records = []
-
-    num_graphs = 0
 
     for filename in filenames:
         print(filename)
@@ -2212,7 +2211,14 @@ def principle2_get_table(filenames, sfx='', environments=True, transitivity_null
 
             records.append(record)
 
+    return records
 
+
+def principle2_get_table(filenames, sfx='', environments=True, transitivity_null=-1, probability_null=-1, er=False, baseline_model_name='Qwen/Qwen3.5-4B'):
+    os.makedirs('figures', exist_ok=True)
+    os.makedirs('tables', exist_ok=True)
+
+    records = principle2_build_summary_records(filenames, er=er)
 
     df = pd.DataFrame(records)
 
@@ -2497,6 +2503,158 @@ def principle2_get_table(filenames, sfx='', environments=True, transitivity_null
 
         fig.savefig(f'figures/top_kcommon{label}_{sfx}.pdf', bbox_inches='tight')
 
+
+
+PRINCIPLE2_RENAME_MODELS = {
+    'gpt-5-nano': 'GPT-5 Nano',
+    'gpt-5-mini': 'GPT-5 Mini',
+    'Qwen-Qwen3.5-4B': 'Qwen 3.5 4B',
+    'Qwen-Qwen3.5-2B': 'Qwen 3.5 2B',
+    'Qwen-Qwen3.5-0.8B': 'Qwen 3.5 0.8B',
+    'gpt-5-nano_cot': 'GPT-5 Nano (CoT)',
+    'gpt-5-mini_cot': 'GPT-5 Mini (CoT)',
+    'Qwen-Qwen3.5-4B_cot': 'Qwen 3.5 4B (CoT)',
+    'Qwen-Qwen3.5-2B_cot': 'Qwen 3.5 2B (CoT)',
+    'Qwen-Qwen3.5-0.8B_cot': 'Qwen 3.5 0.8B (CoT)',
+}
+
+PRINCIPLE2_RENAME_ENV = {
+    'school': 'School',
+    'work': 'Work',
+    'community': 'Community',
+    'school_cot': 'School (CoT)',
+    'work_cot': 'Work (CoT)',
+    'community_cot': 'Community (CoT)',
+}
+
+PRINCIPLE2_GROUP_LABELS = {
+    'sbm': 'Non-CoT SBM initialization',
+    'er': 'ER initialization',
+    'cot': 'CoT',
+}
+
+
+def _principle2_markdown_table(headers, rows):
+    """Render a markdown table without depending on the optional `tabulate`
+    package. Floats are shown with 4 decimals, everything else via ``str``."""
+    def fmt(x):
+        if isinstance(x, bool):
+            return str(x)
+        if isinstance(x, float):
+            if not np.isfinite(x):
+                return '—'
+            return f'{x:.4f}'
+        return str(x)
+
+    lines = [
+        '| ' + ' | '.join(str(h) for h in headers) + ' |',
+        '| ' + ' | '.join('---' for _ in headers) + ' |',
+    ]
+    for row in rows:
+        lines.append('| ' + ' | '.join(fmt(x) for x in row) + ' |')
+    return '\n'.join(lines)
+
+
+def principle2_write_markdown_report(
+    run_results,
+    output_dir,
+    analysis_nulls=None,
+    top_k_breakpoints=(0.1, 0.2, 0.3, 0.4, 0.5),
+    filename='principle_2_results.md',
+    title='Principle 2: Triadic Closure — Results',
+    timestamp=None,
+):
+    """Summarize the configured-experiment results as a markdown file and write
+    it to ``output_dir`` (e.g. the Google Drive output directory).
+
+    For each summary group (SBM / ER / CoT) the report lists, per
+    Model / Environment / Temperature, the mean Marginal Transitivity, the mean
+    Prob. of Edge within Community, and the mean Probability of Connecting to
+    Top-$k$ Common Neighbors at the requested breakpoints, alongside the null
+    baselines produced by the analysis pass."""
+    import datetime
+
+    outfiles_by_group = run_results.get('outfiles_by_group', {})
+    if analysis_nulls is None:
+        analysis_nulls = run_results.get('analysis_nulls', {})
+    if timestamp is None:
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    sections = [f'# {title}', f'_Generated: {timestamp}_']
+
+    for group in ('sbm', 'er', 'cot'):
+        filenames = outfiles_by_group.get(group)
+        if not filenames:
+            continue
+
+        er = group == 'er'
+        records = principle2_build_summary_records(filenames, er=er)
+        if not records:
+            continue
+
+        df = pd.DataFrame(records)
+        df['Model'] = df['Model'].apply(lambda x: PRINCIPLE2_RENAME_MODELS.get(x, x))
+        df['Environment'] = df['Environment'].apply(lambda x: PRINCIPLE2_RENAME_ENV.get(x, x))
+
+        sections.append(f'## {PRINCIPLE2_GROUP_LABELS.get(group, group)}')
+
+        nulls = analysis_nulls.get(group)
+        if nulls and tuple(nulls) != (-1, -1):
+            transitivity_null, probability_null = nulls
+            sections.append(
+                f'- Transitivity null baseline: **{transitivity_null:.4f}**\n'
+                f'- Prob. of edge within community null baseline: **{probability_null:.4f}**'
+            )
+
+        grouped = df.groupby(['Model', 'Environment', 'Temperature'], dropna=False)
+
+        headers = [
+            'Model', 'Environment', 'Temperature',
+            'Marginal Transitivity', 'Prob. of Edge within Community', 'N sims',
+        ]
+        rows = []
+        topk_rows = []
+        for key, sub in grouped:
+            model, environment, temperature = key
+            temp_str = f'{temperature:g}' if isinstance(temperature, (int, float)) else str(temperature)
+            rows.append([
+                model,
+                environment,
+                temp_str,
+                float(sub['Marginal Transitivity'].mean()),
+                float(sub['Prob. of Edge within Community'].mean()),
+                len(sub),
+            ])
+
+            per_row = []
+            for curve in sub['Probability of Connecting to Top-$k$']:
+                curve = np.asarray(curve, dtype=float)
+                n = curve.shape[0]
+                if n == 0:
+                    continue
+                per_row.append([curve[min(int(b * n), n - 1)] for b in top_k_breakpoints])
+            if per_row:
+                mean_vals = np.mean(per_row, axis=0)
+                topk_rows.append([model, environment, temp_str] + [float(v) for v in mean_vals])
+
+        sections.append(_principle2_markdown_table(headers, rows))
+
+        if top_k_breakpoints and topk_rows:
+            topk_headers = ['Model', 'Environment', 'Temperature'] + [
+                f'Top-{int(round(b * 100))}%' for b in top_k_breakpoints
+            ]
+            sections.append('**Probability of Connecting to Top-$k$ Common Neighbors**')
+            sections.append(_principle2_markdown_table(topk_headers, topk_rows))
+
+    if len(sections) <= 2:
+        sections.append('_No analyzable results were found for any summary group._')
+
+    content = '\n\n'.join(sections) + '\n'
+    output_path = os.path.join(os.fspath(output_dir), filename)
+    with open(output_path, 'w') as f:
+        f.write(content)
+    print(f'Wrote markdown report to {output_path}')
+    return output_path
 
 
 def principle2_experiment_outfile(experiment, output_dir):
