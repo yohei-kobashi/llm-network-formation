@@ -7829,8 +7829,25 @@ def combined_select_neighbor(G, t, profiles, temperature=None, num_choices=1, nu
 
     return [], []
 
+def combined_dataset_available(name, datasets_dir='datasets'):
+    """Return True if the local data files for a dataset are present. andorra and
+    mobiled are proprietary and not shipped with the repo, so runs over them are
+    skipped when their files are missing instead of crashing."""
+    if name == 'andorra':
+        required = [os.path.join(datasets_dir, 'andorra', 'andorra.txt')]
+    elif name == 'mobiled':
+        required = [os.path.join(datasets_dir, 'mobiled', 'mobiled.txt')]
+    else:
+        required = [os.path.join(datasets_dir, 'facebook100', f'{name}.mat')]
+    return all(os.path.exists(path) for path in required)
+
+
 def combined_run_network_formation_experiment(name, num_simulations, outfile, temperatures=None, method='llm', num_choices=1, num_samples=-1, num_nodes_samples=-1, model='gpt-5-mini', dataloader_fn=None, sampling_strategy='random', cot=False, cot_config=None):
-    networks = dataloader_fn()
+    try:
+        networks = dataloader_fn()
+    except FileNotFoundError as e:
+        print(f'Skipping {name}: dataset files not found ({e}).')
+        return
 
     if temperatures is None:
         temperatures = [None]
