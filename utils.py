@@ -2657,6 +2657,365 @@ def principle2_write_markdown_report(
     return output_path
 
 
+# --- Shared markdown-report helpers (used by principle 1/2/3/5 reports) ---
+MARKDOWN_RENAME_MODELS = PRINCIPLE2_RENAME_MODELS
+MARKDOWN_RENAME_ENV = PRINCIPLE2_RENAME_ENV
+
+
+def _markdown_model_env(d, fallback_model='', fallback_env='Baseline'):
+    """Derive the display Model / Environment for one jsonl record, matching the
+    logic used inside the `principleN_get_table` plotting helpers."""
+    model = str(d.get('model', fallback_model)).replace('/', '-')
+    if d.get('cot') and not model.endswith('_cot'):
+        model = f'{model}_cot'
+    environment = d.get('environment', fallback_env)
+    if environment is None:
+        environment = 'Baseline'
+    if d.get('cot') and environment != 'Baseline' and not str(environment).endswith('_cot'):
+        environment = f'{environment}_cot'
+    return MARKDOWN_RENAME_MODELS.get(model, model), MARKDOWN_RENAME_ENV.get(environment, environment)
+
+
+def _aggregate_markdown_rows(records, metric_keys, group_keys=('Model', 'Environment', 'Temperature')):
+    """Group records by ``group_keys`` and average each metric across simulations,
+    returning table rows plus a trailing ``N sims`` count."""
+    groups = collections.OrderedDict()
+    for r in records:
+        key = tuple(r.get(k) for k in group_keys)
+        groups.setdefault(key, []).append(r)
+
+    rows = []
+    for key, subs in groups.items():
+        row = []
+        for gk, val in zip(group_keys, key):
+            if gk == 'Temperature' and isinstance(val, (int, float)):
+                row.append(f'{val:g}')
+            else:
+                row.append(val)
+        for mk in metric_keys:
+            vals = [
+                s[mk] for s in subs
+                if isinstance(s.get(mk), (int, float)) and np.isfinite(s[mk])
+            ]
+            row.append(float(np.mean(vals)) if vals else float('nan'))
+        row.append(len(subs))
+        rows.append(row)
+    return rows
+
+
+def _topk_markdown_table(records, breakpoints, curve_key='_topk',
+                         heading='**Probability of Connecting to Top-$k$**'):
+    """Average each group's Top-$k$ cumulative curve at the requested breakpoints."""
+    groups = collections.OrderedDict()
+    for r in records:
+        key = (r['Model'], r['Environment'], r['Temperature'])
+        groups.setdefault(key, []).append(r)
+
+    rows = []
+    for (model, environment, temperature), subs in groups.items():
+        temp_str = f'{temperature:g}' if isinstance(temperature, (int, float)) else str(temperature)
+        per_row = []
+        for s in subs:
+            curve = np.asarray(s[curve_key], dtype=float)
+            n = curve.shape[0]
+            if n == 0:
+                continue
+            per_row.append([curve[min(int(b * n), n - 1)] for b in breakpoints])
+        if not per_row:
+            continue
+        mean_vals = np.mean(per_row, axis=0)
+        rows.append([model, environment, temp_str] + [float(v) for v in mean_vals])
+
+    if not rows:
+        return None
+    headers = ['Model', 'Environment', 'Temperature'] + [
+        f'Top-{int(round(b * 100))}%' for b in breakpoints
+    ]
+    return heading + '\n\n' + _principle2_markdown_table(headers, rows)
+
+
+def _write_markdown_report_file(output_dir, filename, title, sections, timestamp=None):
+    import datetime
+    if timestamp is None:
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    body = [f'# {title}', f'_Generated: {timestamp}_']
+    body.extend(sections)
+    if len(body) <= 2:
+        body.append('_No analyzable results were found._')
+    content = '\n\n'.join(body) + '\n'
+    output_path = os.path.join(os.fspath(output_dir), filename)
+    with open(output_path, 'w') as f:
+        f.write(content)
+    print(f'Wrote markdown report to {output_path}')
+    return output_path
+
+
+def principle1_write_markdown_report(
+    run_results,
+    output_dir,
+    top_k_breakpoints=(0.1, 0.2, 0.3, 0.4, 0.5),
+    filename='principle_1_results.md',
+    title='Principle 1: Preferential Attachment — Results',
+    timestamp=None,
+):
+    """Summarize the Principle 1 (preferential attachment) results as markdown and
+    write them to ``output_dir``. Per Model / Environment / Temperature it reports
+    the mean fitted power-law exponent, its standard error, the KS statistic
+    against a Barabasi-Albert reference, and the Top-$k$ degree-share curve."""
+    groups = [
+        ('Non-CoT', run_results.get('non_cot_outfiles') or []),
+        ('CoT', run_results.get('cot_outfiles') or []),
+    ]
+
+    metric_keys = ['Power-law $\\hat\\gamma$', 'Std. err. $\\sigma$', 'KS stat (vs BA)']
+    sections = []
+
+    for label, filenames in groups:
+        filenames = [f for f in filenames if os.path.exists(f)]
+        if not filenames:
+            continue
+
+        records = []
+        for filename_ in filenames:
+            with open(filename_) as f:
+                lines = f.read().splitlines()
+            for line in lines:
+                d = json.loads(line)
+                Gs = principle1_reconstruct_graphs(d)
+                G = Gs[-1]
+                degrees = np.array([G.degree(n) for n in G.nodes()])
+                if len(degrees) == 0:
+                    continue
+
+                fit = pwl.Fit(degrees, discrete=True)
+                G_ba = nx.barabasi_albert_graph(n=d['n'], m=1, seed=1)
+                degrees_ba = np.array([G_ba.degree(n) for n in G_ba.nodes()])
+                ks = stats.ks_2samp(degrees, degrees_ba)
+
+                sorted_degrees = np.sort(degrees)[::-1]
+                sorted_degrees = np.insert(sorted_degrees, 0, 0)
+                cumsum = np.cumsum(sorted_degrees)
+                topk = cumsum / cumsum[-1] if cumsum[-1] else cumsum
+
+                model, environment = _markdown_model_env(d)
+                records.append({
+                    'Model': model,
+                    'Environment': environment,
+                    'Temperature': d['temperature'],
+                    'Power-law $\\hat\\gamma$': float(fit.alpha),
+                    'Std. err. $\\sigma$': float(fit.sigma),
+                    'KS stat (vs BA)': float(ks[0]),
+                    '_topk': topk,
+                })
+
+        if not records:
+            continue
+
+        sections.append(f'## {label}')
+        rows = _aggregate_markdown_rows(records, metric_keys)
+        headers = ['Model', 'Environment', 'Temperature'] + metric_keys + ['N sims']
+        sections.append(_principle2_markdown_table(headers, rows))
+
+        if top_k_breakpoints:
+            topk_table = _topk_markdown_table(
+                records, top_k_breakpoints,
+                heading='**Probability of Connecting to Top-$k$ (degree share)**',
+            )
+            if topk_table:
+                sections.append(topk_table)
+
+    return _write_markdown_report_file(output_dir, filename, title, sections, timestamp)
+
+
+def principle3_write_markdown_report(
+    run_results,
+    output_dir,
+    filename='principle_3_results.md',
+    title='Principle 3: Homophily — Results',
+    timestamp=None,
+):
+    """Summarize the Principle 3 (homophily) results as markdown and write them to
+    ``output_dir``. Per Model / Environment / Temperature it reports the mean
+    attribute assortativities, Louvain modularity and community structure, plus a
+    Random-graph baseline for comparison."""
+    outfiles_by_group = run_results.get('outfiles_by_group', {})
+    attribute_columns = [
+        ('Location', 'location'),
+        ('Favorite Color', 'favorite color'),
+        ('Hobby', 'hobby'),
+        ('Lucky Number', 'lucky number'),
+    ]
+
+    # (group key, heading, profiles filename, attribute display names, has communities, mutual acceptance)
+    group_specs = [
+        ('profiles', 'Homophily (profiles)', PRINCIPLE3_DEFAULT_PROFILES_FILENAME,
+         ['Location', 'Favorite Color', 'Hobby'], True, False),
+        ('lucky_number', 'Lucky Number', PRINCIPLE3_LUCKY_NUMBER_PROFILES_FILENAME,
+         ['Location', 'Hobby', 'Favorite Color', 'Lucky Number'], False, False),
+        ('mutual_acceptance', 'Mutual Acceptance', PRINCIPLE3_DEFAULT_PROFILES_FILENAME,
+         ['Location', 'Favorite Color', 'Hobby'], True, True),
+        ('cot', 'CoT', PRINCIPLE3_DEFAULT_PROFILES_FILENAME,
+         ['Location', 'Favorite Color', 'Hobby'], True, False),
+    ]
+
+    def assortativities(G):
+        out = {}
+        for display, attr in attribute_columns:
+            try:
+                out[display] = float(nx.attribute_assortativity_coefficient(G, attr))
+            except Exception:
+                out[display] = None
+        return out
+
+    sections = []
+    for group_key, heading, profiles_filename, attr_names, communities, mutual_acceptance in group_specs:
+        filenames = [f for f in (outfiles_by_group.get(group_key) or []) if os.path.exists(f)]
+        if not filenames or not os.path.exists(profiles_filename):
+            continue
+
+        with open(profiles_filename) as f:
+            profiles = [json.loads(line) for line in f.read().splitlines()]
+        profiles_dict = {str(profile['name']): profile for profile in profiles}
+        profiles_dict_int = {int(profile['name']): profile for profile in profiles}
+
+        records = []
+        for filename_ in filenames:
+            with open(filename_) as f:
+                lines = f.read().splitlines()
+            for line in lines:
+                d = json.loads(line)
+                G = nx.from_dict_of_dicts(d['graphs'][-1])
+                nx.set_node_attributes(G, profiles_dict)
+                G.remove_edges_from(nx.selfloop_edges(G))
+                G.remove_nodes_from(list(nx.isolates(G)))
+
+                model, environment = _markdown_model_env(d)
+                record = {'Model': model, 'Environment': environment, 'Temperature': d['temperature']}
+                record.update(assortativities(G))
+
+                if communities:
+                    try:
+                        louvain = nx.algorithms.community.louvain_communities(G, weight='similarity')
+                        record['Modularity'] = float(
+                            nx.algorithms.community.modularity(G, louvain, weight='similarity'))
+                        record['Number of Communities'] = len(louvain)
+                        record['Average Community Size'] = float(np.mean([len(c) for c in louvain]))
+                    except Exception:
+                        pass
+                if mutual_acceptance:
+                    record['Mutual Acceptance Probability'] = d.get('mutual_acceptance_probability', 100)
+
+                records.append(record)
+
+                # Random-graph baseline for the same size/temperature.
+                try:
+                    G_random = principle3_network_growth(
+                        d['n'], d['temperature'], method='random',
+                        model='', environment='', role='')[0][-1]
+                    nx.set_node_attributes(G_random, profiles_dict_int)
+                    random_record = {
+                        'Model': 'Random', 'Environment': 'Baseline', 'Temperature': d['temperature']}
+                    random_record.update(assortativities(G_random))
+                    records.append(random_record)
+                except Exception:
+                    pass
+
+        if not records:
+            continue
+
+        metric_keys = list(attr_names)
+        if communities:
+            metric_keys += ['Modularity', 'Number of Communities', 'Average Community Size']
+        if mutual_acceptance:
+            metric_keys += ['Mutual Acceptance Probability']
+
+        sections.append(f'## {heading}')
+        rows = _aggregate_markdown_rows(records, metric_keys)
+        headers = ['Model', 'Environment', 'Temperature'] + metric_keys + ['N sims']
+        sections.append(_principle2_markdown_table(headers, rows))
+
+    return _write_markdown_report_file(output_dir, filename, title, sections, timestamp)
+
+
+def principle5_write_markdown_report(
+    run_results,
+    output_dir,
+    filename='principle_5_results.md',
+    title='Principle 5: Small-World Phenomenon — Results',
+    timestamp=None,
+):
+    """Summarize the Principle 5 (small-world) results as markdown and write them to
+    ``output_dir``. Per Model / Environment / Temperature / (n, k, beta) it reports
+    the mean average shortest-path length ``L`` and clustering coefficient ``C``,
+    alongside a Watts-Strogatz baseline for each (n, k, beta)."""
+    outfiles_by_group = run_results.get('outfiles_by_group', {})
+    group_labels = {'default': 'Default', 'cot': 'CoT'}
+    group_keys = ('Model', 'Environment', 'Temperature', 'n', 'k', 'beta')
+    metric_keys = ['$L$', '$C$']
+
+    def reconstruct(graph):
+        G = nx.Graph()
+        for node, neighbors in graph.items():
+            node = int(node)
+            G.add_node(node)
+            for neighbor in neighbors:
+                G.add_edge(node, neighbor)
+        return G
+
+    sections = []
+    for group_key in ('default', 'cot'):
+        filenames = [f for f in (outfiles_by_group.get(group_key) or []) if os.path.exists(f)]
+        if not filenames:
+            continue
+
+        records = []
+        watts_strogatz_seen = set()
+        for filename_ in filenames:
+            with open(filename_) as f:
+                lines = f.read().splitlines()
+            for line in lines:
+                d = json.loads(line)
+                G = reconstruct(d['graphs'][-1])
+                try:
+                    length = principle5_average_shortest_path_length_lcc(G)
+                    clustering = nx.average_clustering(G)
+                except Exception:
+                    continue
+
+                model, environment = _markdown_model_env(d)
+                records.append({
+                    'Model': model, 'Environment': environment, 'Temperature': d['temperature'],
+                    'n': d['n'], 'k': d['k'], 'beta': d['beta'],
+                    '$L$': float(length), '$C$': float(clustering),
+                })
+                watts_strogatz_seen.add((d['n'], d['k'], d['beta']))
+
+        # Watts-Strogatz reference for each (n, k, beta).
+        for n, k, beta in sorted(watts_strogatz_seen):
+            try:
+                Gs, _ = principle5_network_growth(
+                    n, k, beta, 0, method='W-S', model='', environment='', role='')
+                length = principle5_average_shortest_path_length_lcc(Gs[-1])
+                clustering = nx.average_clustering(Gs[-1])
+            except Exception:
+                continue
+            records.append({
+                'Model': 'Watts-Strogatz', 'Environment': 'Baseline', 'Temperature': '—',
+                'n': n, 'k': k, 'beta': beta,
+                '$L$': float(length), '$C$': float(clustering),
+            })
+
+        if not records:
+            continue
+
+        sections.append(f'## {group_labels.get(group_key, group_key)}')
+        rows = _aggregate_markdown_rows(records, metric_keys, group_keys=group_keys)
+        headers = list(group_keys) + metric_keys + ['N sims']
+        sections.append(_principle2_markdown_table(headers, rows))
+
+    return _write_markdown_report_file(output_dir, filename, title, sections, timestamp)
+
+
 def principle2_experiment_outfile(experiment, output_dir):
     return str(os.path.join(os.fspath(output_dir), f"principle_2_{experiment['name']}.jsonl"))
 
