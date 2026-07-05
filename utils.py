@@ -8171,7 +8171,7 @@ def combined_compare_models(filenames1, filenames2, bias=True, log_transform=Tru
             else:
                 print(f'Comparing {model1} and {model2} on {d1["name"]} at temperature {d1["temperature"]}')
 
-            distance_mean, distance_std, theta_spearman, theta1, theta2, sd1, sd2, ame1, ame2, sdame1, sdame2, p_values_ame1, p_values_ame2 = dcm.combined_compare_models((d1['results'], d1['candidates']), (d2['results'], d2['candidates']), on='Alternative Set', method='tv', bias=bias, feature_names=feature_names, log_transform=log_transform, exclude_log=exclude_log, calculate_p_values=True, calculate_average_marginal_effects=True, input_type='results_candidates')
+            distance_mean, distance_std, theta_spearman, theta1, theta2, sd1, sd2, ame1, ame2, sdame1, sdame2, p_values_ame1, p_values_ame2 = dcm.compare_models((d1['results'], d1['candidates']), (d2['results'], d2['candidates']), on='Alternative Set', method='tv', bias=bias, feature_names=feature_names, log_transform=log_transform, exclude_log=exclude_log, calculate_p_values=True, calculate_average_marginal_effects=True, input_type='results_candidates')
 
             records_between_models.append({
                 'Name' : d1['name'].capitalize(),
