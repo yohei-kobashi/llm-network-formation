@@ -22,7 +22,6 @@ import powerlaw as pwl
 import seaborn as sns
 import replicate
 import anthropic
-import torch
 import statsmodels.api as sm
 import dataloader
 import link_prediction
@@ -30,7 +29,24 @@ import dcm
 from openai import OpenAI
 from sklearn.neighbors import NearestNeighbors
 from statsmodels.iolib.summary2 import summary_col
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# torch and transformers are only needed for the local Qwen (GPU / Transformers
+# fallback) path. Import them lazily so API-only runs (e.g. gpt-5-nano) work
+# without the heavy GPU stack installed.
+try:
+    import torch
+    torch_import_error = None
+except Exception as e:
+    torch = None
+    torch_import_error = e
+
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    transformers_import_error = None
+except Exception as e:
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+    transformers_import_error = e
 
 try:
     from vllm import LLM, SamplingParams
@@ -181,6 +197,10 @@ def _get_vllm_client(model):
 
 
 def _get_transformers_client(model):
+    if AutoTokenizer is None or torch is None:
+        detail = f" Import error: {transformers_import_error or torch_import_error}"
+        raise RuntimeError(
+            f"transformers/torch are not installed; cannot run local model {model}.{detail}")
     if model in transformers_unavailable_models:
         raise RuntimeError(f"Transformers fallback is unavailable for {model}.")
 
