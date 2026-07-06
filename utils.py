@@ -7663,14 +7663,15 @@ def combined_network_growth(G0, temperature=None, name='', num_choices=1, method
 
             print(f'Node: {t}, Links: {result}, Candidates: {candidate}')
 
-        Gs.append(G.copy())
-
         # Periodically persist progress so a disconnect only loses the last few
         # nodes instead of the whole ego.
         if checkpoint_path and method == 'llm' and (i + 1) % checkpoint_every == 0 and (i + 1) < len(nodes):
             _combined_save_checkpoint(checkpoint_path, i + 1, results, candidates)
 
-    return Gs, results, candidates
+    # Only the initial (Gs[0]) and final graph are used downstream, so keep just
+    # those two snapshots. Previously the whole graph was copied every node, which
+    # grew CPU memory unboundedly for large egos (thousands of full-graph copies).
+    return [Gs[0], G], results, candidates
 
 def combined_fit_dcm(results):
 
